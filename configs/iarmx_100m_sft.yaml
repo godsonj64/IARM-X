@@ -1,0 +1,48 @@
+# IARM-X ~100M UltraChat SFT. Starts from the completed FineWeb-Edu checkpoint.
+model:
+  vocab_size: 50260
+  dim: 768
+  n_layers: 8
+  n_heads: 12
+  ffn_hidden: 1984
+  max_seq_len: 2048
+  dropout: 0.05
+  rope_theta: 10000.0
+  n_operators: 4
+  operator_rank: 16
+  local_kernel: 5
+  attention_every: 4
+  fast_memory_rank: 32
+  memory_decay_min: 0.90
+  memory_decay_max: 0.9999
+  attention_bias_from_importance: true
+  importance_scale_init: 0.10
+  tie_embeddings: true
+  gradient_checkpointing: true
+  use_sdpa: true
+
+data:
+  stage: sft
+  tokenizer: gpt2
+  dataset: HuggingFaceH4/ultrachat_200k
+  split: train_sft
+  seq_len: 512
+
+training:
+  init_from: checkpoints/iarmx-100m-pretrain/final
+  seed: 42
+  micro_batch_size: 16
+  grad_accum: 8
+  epochs: 2
+  lr: 0.00025
+  min_lr: 0.000025
+  warmup_steps: 300
+  betas: [0.9, 0.95]
+  weight_decay: 0.05
+  grad_clip: 1.0
+  precision: bf16
+  compile: true
+  num_workers: 2
+  log_every: 10
+  save_every: 500
+  output_dir: checkpoints/iarmx-100m-sft

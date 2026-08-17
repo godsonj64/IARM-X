@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "iarm-x"
+version = "0.3.0"
+description = "IARM-X: hybrid inductive algebraic resonance memory + selective associative memory + sparse exact attention"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "Apache-2.0"}
+authors = [{name = "Godson Johnson"}]
+dependencies = [
+  "torch>=2.5",
+  "transformers>=4.51",
+  "datasets>=3.0",
+  "tokenizers>=0.20",
+  "safetensors>=0.4",
+  "pyyaml>=6.0",
+  "tqdm>=4.66",
+  "numpy>=1.26",
+  "huggingface_hub>=0.28",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6"]
+wandb = ["wandb>=0.17"]
+
+[project.scripts]
+iarmx-train = "iarmx.training.train:main"
+iarmx-generate = "iarmx.generate:main"
+iarmx-eval = "iarmx.eval.runner:main"
+
+[tool.setuptools.packages.find]
+include = ["iarmx*"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,49 @@
+# Research-scale 3:1 hybrid. Verified parameter count: 1,309,384,768 (1.309B).
+# Re-run scripts/count_params.py --meta after any architecture change.
+model:
+  vocab_size: 50260
+  dim: 2048
+  n_layers: 24
+  n_heads: 16
+  ffn_hidden: 4480
+  max_seq_len: 4096
+  dropout: 0.0
+  rope_theta: 10000.0
+  n_operators: 8
+  operator_rank: 32
+  local_kernel: 5
+  attention_every: 4       # R,R,R,A = 3:1 recurrent:attention
+  fast_memory_rank: 64
+  memory_decay_min: 0.90
+  memory_decay_max: 0.9999
+  attention_bias_from_importance: true
+  tie_embeddings: true
+  gradient_checkpointing: true
+  use_sdpa: true
+
+data:
+  stage: pretrain
+  tokenizer: gpt2
+  dataset: HuggingFaceFW/fineweb-edu
+  dataset_config: sample-10BT
+  split: train
+  seq_len: 2048
+  streaming: true
+  pack: true
+
+training:
+  seed: 42
+  micro_batch_size: 1
+  grad_accum: 64
+  max_steps: 100000
+  lr: 0.0002
+  min_lr: 0.00002
+  warmup_steps: 2000
+  betas: [0.9, 0.95]
+  weight_decay: 0.1
+  grad_clip: 1.0
+  precision: bf16
+  compile: true
+  log_every: 10
+  save_every: 1000
+  output_dir: checkpoints/iarmx-1.3b
