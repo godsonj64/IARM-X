@@ -5,11 +5,36 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "iarm-x"
 version = "0.3.0"
-description = "IARM-X: hybrid inductive algebraic resonance memory + selective associative memory + sparse exact attention"
+description = "Hybrid language-model architecture combining algebraic resonance memory, associative recurrent memory, and sparse exact attention"
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "Apache-2.0"}
 authors = [{name = "Godson Johnson"}]
+keywords = [
+  "iarm",
+  "iarm-x",
+  "language-models",
+  "llm",
+  "pytorch",
+  "deep-learning",
+  "recurrent-memory",
+  "associative-memory",
+  "attention",
+  "transformers",
+  "long-context",
+  "sequence-modeling",
+  "fineweb",
+  "ultrachat",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
   "torch>=2.5",
   "transformers>=4.51",
@@ -21,6 +46,13 @@ dependencies = [
   "numpy>=1.26",
   "huggingface_hub>=0.28",
 ]
+
+[project.urls]
+Homepage = "https://github.com/godsonj64/IARM-X"
+Repository = "https://github.com/godsonj64/IARM-X"
+Documentation = "https://github.com/godsonj64/IARM-X#readme"
+Issues = "https://github.com/godsonj64/IARM-X/issues"
+Paper = "https://doi.org/10.20944/preprints202607.1228.v1"
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.6"]
