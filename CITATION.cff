@@ -1,0 +1,32 @@
+cff-version: 1.2.0
+message: "If you use IARM-X in research, please cite this software and the original IARM paper."
+title: "IARM-X: Inductive Algebraic Resonance Attention Memory"
+type: software
+authors:
+  - family-names: Johnson
+    given-names: Godson
+repository-code: "https://github.com/godsonj64/IARM-X"
+url: "https://github.com/godsonj64/IARM-X"
+license: Apache-2.0
+version: 0.3.0
+date-released: 2026-08-18
+keywords:
+  - language models
+  - IARM
+  - algebraic resonance memory
+  - recurrent memory
+  - associative memory
+  - attention
+  - long-context modeling
+  - PyTorch
+  - deep learning
+preferred-citation:
+  type: article
+  title: "Inductive Algebraic Resonance Memory for Attention-Free Language Modelling"
+  authors:
+    - family-names: Johnson
+      given-names: Godson
+  year: 2026
+  publisher:
+    name: Preprints.org
+  doi: "10.20944/preprints202607.1228.v1"
