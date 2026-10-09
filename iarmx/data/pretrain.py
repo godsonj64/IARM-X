@@ -18,25 +18,38 @@ def build_pretrain_dataset(
             dataset_name, dataset_config, split=split, streaming=streaming
         )
 
-    def tokenize(example):
-        # Bound the size of any one streamed document presented to the collator.
-        # The collator packs across documents and masks only synthetic tail padding.
-        return tokenizer(
-            example["text"],
-            add_special_tokens=False,
-            truncation=True,
-            max_length=seq_len * 4,
-        )
+    def tokenize(batch):
+        ids = tokenizer(batch["text"], add_special_tokens=False)["input_ids"]
+        return split_documents(ids, seq_len * 4)
 
-    return ds.map(tokenize, remove_columns=None)
+    # Splitting changes the row count, so every source column must be dropped.
+    columns = ds.column_names or list(next(iter(ds)).keys())
+    return ds.map(tokenize, batched=True, remove_columns=columns)
+
+
+def split_documents(batch_ids, max_len: int):
+    """Split tokenized documents into pieces of at most ``max_len`` tokens.
+
+    This bounds what one example presents to the collator without discarding
+    anything: ``doc_end`` marks the last piece of each document, so the collator
+    emits exactly one boundary token per document.
+    """
+    pieces, ends = [], []
+    for ids in batch_ids:
+        for start in range(0, len(ids), max_len):
+            pieces.append(ids[start : start + max_len])
+            ends.append(start + max_len >= len(ids))
+    return {"input_ids": pieces, "doc_end": ends}
 
 
 def collate_pretrain(batch, pad_id: int, seq_len: int, pack: bool = True):
     """Create next-token examples and mask synthetic trailing padding.
 
     With ``pack=True`` tokenized documents are concatenated with one EOS/pad
-    boundary token between them, then split into fixed-length blocks. Boundary EOS
-    tokens are genuine targets; only synthetic tail padding is ignored.
+    boundary token after each document, then split into fixed-length blocks.
+    Boundary EOS tokens are genuine targets; only synthetic tail padding is
+    ignored. Pieces from ``split_documents`` with ``doc_end=False`` continue their
+    document, so no boundary token follows them.
     """
     import torch
 
@@ -50,7 +63,8 @@ def collate_pretrain(batch, pad_id: int, seq_len: int, pack: bool = True):
             if not ids:
                 continue
             stream.extend(ids)
-            stream.append(pad_id)
+            if ex.get("doc_end", True):
+                stream.append(pad_id)
         for start in range(0, len(stream), target_len):
             chunk = stream[start : start + target_len]
             if len(chunk) < 2:

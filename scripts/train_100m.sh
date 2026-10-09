@@ -5,9 +5,11 @@ set -euo pipefail
 #   bash scripts/train_100m.sh
 #   NPROC=2 bash scripts/train_100m.sh
 # Set LOCAL_DATA=1 to use parquet downloaded by scripts/download_datasets.py.
+# Set MEMMAP=1 to use token shards written by scripts/pretokenize.py (exact resume).
 
 NPROC="${NPROC:-1}"
 LOCAL_DATA="${LOCAL_DATA:-0}"
+MEMMAP="${MEMMAP:-0}"
 
 if [[ "$LOCAL_DATA" == "1" ]]; then
   PRETRAIN_CONFIG="configs/iarmx_100m_pretrain_local.yaml"
@@ -15,6 +17,9 @@ if [[ "$LOCAL_DATA" == "1" ]]; then
 else
   PRETRAIN_CONFIG="configs/iarmx_100m_pretrain.yaml"
   SFT_CONFIG="configs/iarmx_100m_sft.yaml"
+fi
+if [[ "$MEMMAP" == "1" ]]; then
+  PRETRAIN_CONFIG="configs/iarmx_100m_pretrain_memmap.yaml"
 fi
 
 run_train () {

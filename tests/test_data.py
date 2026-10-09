@@ -1,6 +1,6 @@
 import torch
 
-from iarmx.data.pretrain import collate_pretrain
+from iarmx.data.pretrain import collate_pretrain, split_documents
 from iarmx.data.sft import render_ultrachat, collate_sft
 
 
@@ -59,3 +59,22 @@ def test_pretrain_packing_uses_document_boundary_but_masks_tail():
     assert out["input_ids"][0].tolist() == [1, 2, 3, 9]
     assert out["labels"][0].tolist() == [2, 3, 9, 4]
     assert out["labels"][1].tolist() == [6, 9, -100, -100]
+
+
+def test_split_documents_keeps_every_token_and_marks_document_ends():
+    docs = [[], [1, 2, 3], list(range(10, 20))]
+    out = split_documents(docs, max_len=4)
+    assert out["input_ids"] == [[1, 2, 3], [10, 11, 12, 13], [14, 15, 16, 17], [18, 19]]
+    assert out["doc_end"] == [True, False, False, True]
+
+
+def test_packing_split_pieces_emits_one_boundary_per_document():
+    docs = [[1, 2, 3], list(range(10, 20))]
+    pieces = split_documents(docs, max_len=4)
+    batch = [{"input_ids": i, "doc_end": e} for i, e in zip(pieces["input_ids"], pieces["doc_end"])]
+    out = collate_pretrain(batch, pad_id=9, seq_len=40, pack=True)
+    stream = [1, 2, 3, 9] + list(range(10, 20)) + [9]
+    valid = len(stream) - 1
+    assert out["input_ids"][0, :valid].tolist() == stream[:-1]
+    assert out["labels"][0, :valid].tolist() == stream[1:]
+    assert (out["labels"][0, valid:] == -100).all()

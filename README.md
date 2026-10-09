@@ -189,11 +189,22 @@ The provided research recipe uses:
 - **Pretraining:** `HuggingFaceFW/fineweb-edu`, configuration `sample-10BT`.
 - **SFT:** `HuggingFaceH4/ultrachat_200k`, split `train_sft`.
 
+### Pre-tokenize once (recommended for paid or preemptible GPUs)
+
+```bash
+python scripts/pretokenize.py --out data/tokens/fineweb-edu-10bt-gpt2 --num-proc 8
+MEMMAP=1 bash scripts/train_100m.sh
+```
+
+`scripts/pretokenize.py` keeps every document whole (no truncation), appends one EOS per document and writes about 20 GB of `uint16` token shards plus an `index.json`. It runs on CPU, so do it before renting a GPU. `configs/iarmx_100m_pretrain_memmap.yaml` trains on fixed 512-token windows read from those shards; every token is a training target exactly once per epoch and no compute is spent on padding. Add `--data-files "data/raw/fineweb-edu-10bt/sample/10BT/*.parquet"` to tokenize the local copy from `scripts/download_datasets.py` instead of streaming from the Hub, or `--max-tokens 100000000` for a pilot run.
+
 ### Stream FineWeb-Edu directly
 
 ```bash
 python -m iarmx.training.train --config configs/iarmx_100m_pretrain.yaml
 ```
+
+Streaming tokenizes on the fly. Documents longer than `4 × seq_len` tokens are split into consecutive pieces, not truncated.
 
 ### Download datasets once
 
@@ -237,6 +248,7 @@ configs/
 ├── sft_debug.yaml
 ├── iarmx_100m_pretrain.yaml
 ├── iarmx_100m_pretrain_local.yaml
+├── iarmx_100m_pretrain_memmap.yaml
 ├── iarmx_100m_sft.yaml
 ├── iarmx_100m_sft_local.yaml
 └── iarmx_1.3b.yaml
@@ -298,7 +310,12 @@ iarmx-train \
   --resume checkpoints/iarmx-100m-pretrain/step-10000.pt
 ```
 
-`--resume` restores model, optimizer, scheduler, step, and tracked training counters. `--init-from` loads pretrained model weights into a fresh training stage.
+`--resume` restores model, optimizer, scheduler, step, tracked training counters, each rank's RNG streams and the exact data position, so a resumed run continues with the next unseen batch instead of replaying data:
+
+- `dataset: memmap` stores the global window position; it resumes exactly even on a different number of GPUs.
+- Streaming and map-style datasets (including SFT) store each rank's `StatefulDataLoader` state; they resume exactly on the same number of GPUs and refuse to resume on a different one rather than replay data.
+
+With the same GPU count, a resumed run reproduces the uninterrupted run bit-for-bit (`tests/test_resume.py`). `--init-from` loads pretrained model weights into a fresh training stage, starting its data from the beginning.
 
 ## Generation
 
@@ -338,9 +355,11 @@ python scripts/smoke_test.py
 python -m compileall -q iarmx scripts tests
 ```
 
-The current documented regression suite passes **35/35 tests** and covers:
+The current documented regression suite passes **62/62 tests** and covers:
 
 - chunkwise-parallel vs per-token recurrent scan parity (outputs, state, gradients, cached decoding);
+- bit-exact resume for token-shard, streaming and map-style data (0 and 2 loader workers, epoch wrap, 2-process DDP) and token-shard resume on a different world size;
+- pre-tokenization without truncation, token-window/label alignment across shards, and long-document splitting with one boundary token per document;
 - full-vs-cached and arbitrary-chunk parity;
 - zero future-token leakage;
 - exact convolution-cache behavior;
@@ -386,6 +405,7 @@ IARM-X/
 │   ├── count_params.py
 │   ├── download_datasets.py
 │   ├── estimate_cost.py
+│   ├── pretokenize.py
 │   ├── profile_model.py
 │   ├── smoke_test.py
 │   └── train_100m.sh

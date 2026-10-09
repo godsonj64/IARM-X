@@ -4,16 +4,18 @@ import math
 import os
 from functools import partial
 from pathlib import Path
+import numpy as np
 import yaml
 import torch
-from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
+from torchdata.stateful_dataloader import StatefulDataLoader
 
 from ..config import IARMXConfig
 from ..model.model import IARMXForCausalLM
 from ..data.tokenizer import load_tokenizer
+from ..data.memmap import TokenWindows, WindowSampler
 from ..data.pretrain import build_pretrain_dataset, collate_pretrain
 from ..data.sft import build_sft_dataset, collate_sft
 from .checkpoint import save_checkpoint, load_checkpoint, unwrap_model
@@ -72,9 +74,12 @@ def shard_dataset(ds, world: int, rank: int, streaming: bool, seed: int):
     )
 
 
-def build_loader(ds, collate, train_cfg, world, rank, streaming, seed):
-    ds, sampler = shard_dataset(ds, world, rank, streaming, seed)
-    loader = DataLoader(
+def build_loader(ds, collate, train_cfg, world, rank, streaming, seed, sampler=None):
+    if sampler is None:
+        ds, sampler = shard_dataset(ds, world, rank, streaming, seed)
+    # A drop-in DataLoader whose state_dict() records exactly which samples were
+    # consumed, including inside worker processes and streaming datasets.
+    loader = StatefulDataLoader(
         ds,
         batch_size=train_cfg["micro_batch_size"],
         collate_fn=collate,
@@ -84,6 +89,35 @@ def build_loader(ds, collate, train_cfg, world, rank, streaming, seed):
         pin_memory=torch.cuda.is_available(),
     )
     return loader, sampler
+
+
+def capture_data_state(loader, sampler_epoch, memmap_position, world):
+    """Snapshot every rank's data position and RNG streams. A collective when world > 1.
+
+    RNG states are stored as numpy arrays so ``torch.load(map_location=...)``
+    cannot move them off the CPU.
+    """
+    local = {
+        "rng_cpu": torch.get_rng_state().numpy(),
+        "rng_cuda": torch.cuda.get_rng_state().numpy() if torch.cuda.is_available() else None,
+    }
+    if memmap_position is None:
+        local["loader"] = loader.state_dict()
+        local["epoch"] = sampler_epoch
+    ranks = [local]
+    if world > 1:
+        ranks = [None] * world
+        torch.distributed.all_gather_object(ranks, local)
+    state = {"world": world, "ranks": ranks}
+    if memmap_position is not None:
+        state["memmap"] = memmap_position
+    return state
+
+
+def restore_rng(local):
+    torch.set_rng_state(torch.from_numpy(np.array(local["rng_cpu"], dtype=np.uint8)))
+    if torch.cuda.is_available() and local.get("rng_cuda") is not None:
+        torch.cuda.set_rng_state(torch.from_numpy(np.array(local["rng_cuda"], dtype=np.uint8)))
 
 
 def allreduce_int(value: int, device: torch.device, world: int) -> int:
@@ -149,7 +183,10 @@ def main():
     cfg.vocab_size = len(tok)
 
     stage = data_cfg.get("stage", "pretrain")
-    streaming = bool(data_cfg.get("streaming", False)) if stage == "pretrain" else False
+    memmap = stage == "pretrain" and data_cfg.get("dataset") == "memmap"
+    streaming = (
+        bool(data_cfg.get("streaming", False)) if stage == "pretrain" and not memmap else False
+    )
     data_files = data_cfg.get("data_files")
     if stage == "sft":
         ds = build_sft_dataset(
@@ -160,6 +197,13 @@ def main():
             data_files=data_files,
         )
         collate = partial(collate_sft, pad_id=tok.pad_token_id)
+    elif memmap:
+        ds = TokenWindows(data_cfg["path"], data_cfg["seq_len"])
+        if ds.vocab_size > len(tok):
+            raise ValueError(
+                f"token shards use a vocabulary of {ds.vocab_size} but the tokenizer has {len(tok)}"
+            )
+        collate = None  # windows are already fixed-length tensors
     else:
         ds = build_pretrain_dataset(
             tok,
@@ -178,7 +222,6 @@ def main():
         )
 
     dataset_len = None if streaming else len(ds)
-    loader, sampler = build_loader(ds, collate, train, world, rank, streaming, seed)
 
     init_from = args.init_from or train.get("init_from")
     if args.resume and init_from:
@@ -212,17 +255,84 @@ def main():
     step = 0
     tokens_seen = 0
     examples_seen = 0
+    data_state = None
     if args.resume:
         ckpt = load_checkpoint(args.resume, base_model, optimizer, sched, map_location=device)
         step = int(ckpt.get("step", 0))
         extra = ckpt.get("extra") or {}
         tokens_seen = int(extra.get("tokens_seen", 0))
         examples_seen = int(extra.get("examples_seen", 0))
+        data_state = extra.get("data")
         if rank == 0:
             print(
                 f"resumed={args.resume} step={step} tokens={tokens_seen} examples={examples_seen}",
                 flush=True,
             )
+
+    # The loader is built after resume so it can start at the saved data position.
+    sampler = None
+    memmap_spec = None
+    if memmap:
+        # Every row is one window, so the global data position is examples_seen.
+        memmap_spec = {
+            "seq_len": ds.seq_len,
+            "n_windows": ds.n_windows,
+            "shuffle": bool(data_cfg.get("shuffle", True)),
+            "seed": int(seed),
+        }
+        start = 0
+        saved = (data_state or {}).get("memmap")
+        if saved is not None:
+            changed = {k: (saved.get(k), v) for k, v in memmap_spec.items() if saved.get(k) != v}
+            if changed:
+                raise ValueError(
+                    f"cannot resume the token-window order; changed (saved, now): {changed}. "
+                    "Start a new stage with --init-from instead."
+                )
+            start = int(saved["position"])
+        elif args.resume and rank == 0:
+            print("checkpoint has no token-window position; data starts at window 0", flush=True)
+        sampler = WindowSampler(
+            ds.n_windows, start, world, rank, memmap_spec["shuffle"], memmap_spec["seed"]
+        )
+    loader, sampler = build_loader(ds, collate, train, world, rank, streaming, seed, sampler)
+
+    sampler_epoch = 0
+    rng_state = None
+    if data_state is not None and data_state.get("world") == world:
+        local = data_state["ranks"][rank]
+        rng_state = local
+        if not memmap and "loader" in local:
+            sampler_epoch = int(local["epoch"])
+            if sampler is not None:
+                sampler.set_epoch(sampler_epoch)
+            loader.load_state_dict(local["loader"])
+    elif data_state is not None and not memmap:
+        raise ValueError(
+            f"checkpoint data state was saved with world size {data_state.get('world')}, "
+            f"now {world}: exact resume of a streaming or map-style dataset needs the same "
+            "world size. Use dataset: memmap to resume across world sizes, or start a new "
+            "stage with --init-from."
+        )
+    elif data_state is not None and rank == 0:
+        print(
+            f"world size changed ({data_state.get('world')} -> {world}): token-window position "
+            "restored exactly; RNG streams are reseeded",
+            flush=True,
+        )
+    elif args.resume and not memmap and rank == 0:
+        print(
+            "checkpoint has no data-loader state; the data stream restarts from the beginning",
+            flush=True,
+        )
+
+    def data_extra():
+        position = None if memmap_spec is None else {**memmap_spec, "position": examples_seen}
+        return {
+            "tokens_seen": tokens_seen,
+            "examples_seen": examples_seen,
+            "data": capture_data_state(loader, sampler_epoch, position, world),
+        }
 
     model = base_model
     if train.get("compile", False) and hasattr(torch, "compile"):
@@ -252,7 +362,10 @@ def main():
     model.train()
     optimizer.zero_grad(set_to_none=True)
     iterator = iter(loader)
-    sampler_epoch = 0
+    if rng_state is not None:
+        # After iter(): creating an iterator draws a base seed from the global RNG,
+        # which the uninterrupted run did before the checkpointed step, not after.
+        restore_rng(rng_state)
     while not should_stop(step, tokens_seen, examples_seen, train, dataset_len):
         running = 0.0
         local_tokens = 0
@@ -303,26 +416,15 @@ def main():
                 f"tokens={tokens_seen:,} examples={examples_seen:,}",
                 flush=True,
             )
-        if rank == 0 and step % save_every == 0:
-            save_checkpoint(
-                out_dir / f"step-{step}.pt",
-                model,
-                optimizer,
-                sched,
-                step,
-                extra={"tokens_seen": tokens_seen, "examples_seen": examples_seen},
-            )
+        if step % save_every == 0:
+            extra = data_extra()  # collective: every rank must reach it
+            if rank == 0:
+                save_checkpoint(out_dir / f"step-{step}.pt", model, optimizer, sched, step, extra)
 
+    extra = data_extra()
     if rank == 0:
         unwrap_model(model).save_pretrained(out_dir / "final")
-        save_checkpoint(
-            out_dir / "last.pt",
-            model,
-            optimizer,
-            sched,
-            step,
-            extra={"tokens_seen": tokens_seen, "examples_seen": examples_seen},
-        )
+        save_checkpoint(out_dir / "last.pt", model, optimizer, sched, step, extra)
         print(
             f"finished step={step} tokens={tokens_seen:,} examples={examples_seen:,}",
             flush=True,

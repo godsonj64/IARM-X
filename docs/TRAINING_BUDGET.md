@@ -120,8 +120,8 @@ Reproduce with `python scripts/bench_scan.py --config configs/iarmx_100m_pretrai
 | Per-micro-step GPU→CPU syncs (`.item()` on device labels, `float(loss)`) | `training/train.py` | The host cannot queue the next kernels while the GPU works; small models become latency-bound | **Fixed** |
 | Gradient checkpointing on the 100M model | `iarmx_100m_*.yaml` | +33% layer FLOPs. A 100M model probably fits a 24 GB card without it (untested here) | Recommend `gradient_checkpointing: false` after a memory test |
 | Attention Q/K augmented to head dim 65 for the importance bias | `model/attention.py` | PyTorch's flash/memory-efficient SDPA kernels require head dims that are multiples of 8 (and flash requires equal Q/K/V dims), so these layers likely fall back to the math kernel | Pad the extra coordinate to 72, or use FlexAttention `score_mod`. Verify with `torch.nn.attention.sdpa_kernel` |
-| Documents truncated at `4 × seq_len` = 2048 tokens | `data/pretrain.py` | Long-document tails are discarded, so `sample-10BT` cannot supply 10B unique tokens and the loader silently starts a second pass | Pre-tokenize without truncation (section 6) |
-| `--resume` restarts the data stream from the beginning | `training/train.py` | On preemptible instances every restart replays already-seen data | Index a pre-tokenized memmap by `tokens_seen` (section 7.4) |
+| Documents truncated at `4 × seq_len` = 2048 tokens | `data/pretrain.py` | Long-document tails are discarded, so `sample-10BT` cannot supply 10B unique tokens and the loader silently starts a second pass | **Fixed**: `scripts/pretokenize.py` keeps whole documents; streaming splits long documents into pieces |
+| `--resume` restarts the data stream from the beginning | `training/train.py` | On preemptible instances every restart replays already-seen data | **Fixed**: exact data position and RNG state in every checkpoint (section 7.4) |
 
 ---
 
@@ -310,12 +310,13 @@ and it changes the model, so baselines must match. A fused linear-cross-entropy
 kernel (e.g. Liger, Cut Cross-Entropy) gives no FLOP savings but removes the
 [tokens × 50k] logits memory, which is what lets you drop gradient checkpointing.
 
-**Pre-tokenize once, on CPU.** 10B GPT-2 tokens as `uint16` take 20 GB. One
-CPU pass with `tiktoken` takes minutes on a multi-core box, and CPU hours cost
-a few cents (or nothing on a free notebook). This also fixes the truncation and
-resume issues in section 2, gives fixed-shape batches (no `torch.compile`
-recompiles from the variable row count of the current packing collator), and
-makes data order deterministic.
+**Pre-tokenize once, on CPU.** 10B GPT-2 tokens as `uint16` take 20 GB.
+`scripts/pretokenize.py --num-proc N` does it in one parallel pass on any
+multi-core machine, and CPU hours cost a few cents (or nothing on a free
+notebook), so the GPU never waits on tokenization. Training then reads fixed
+windows (`dataset: memmap`): no truncation, no padding, fixed-shape batches
+(no `torch.compile` recompiles from the packing collator's variable row
+count), and a deterministic order.
 
 **Soft labels carry more bits per token, but the teacher costs too much.**
 Distillation gives the student a full distribution per position instead of one
@@ -372,10 +373,15 @@ background thread to push $\delta$ toward 0.
 
 ### 7.4 Exact resume is part of the price
 
-Section 2's `--resume` replays the stream from the start. Under preemption
-that is a hidden tax: you pay for duplicate tokens and never see the tail of
-the data. With pre-tokenized shards, the data position is simply
-`tokens_seen`, so resume is exact and free.
+Section 2's `--resume` used to replay the stream from the start. Under
+preemption that is a hidden tax: you pay for duplicate tokens and never see the
+tail of the data. Checkpoints now carry the exact data position and every
+rank's RNG state. With pre-tokenized shards the position is one integer (global
+windows consumed), so a run resumes exactly even on a different number of GPUs.
+Streaming and SFT runs store `StatefulDataLoader` state and resume exactly on
+the same GPU count. Either way, a resumed run matches the uninterrupted one
+bit-for-bit (`tests/test_resume.py`), so a preemption costs only the work since
+the last checkpoint.
 
 ### 7.5 Real options and the value of information
 
@@ -489,8 +495,9 @@ These do not lower the cost of *processing* 10B tokens. They raise what the
 
 1. Use this branch (`scan_impl: chunk`). Set `gradient_checkpointing: false`
    if the memory test passes, and keep `compile: true`.
-2. Pre-tokenize FineWeb-Edu `sample-10BT` to `uint16` shards without
-   truncation, then train from a memmap with exact `tokens_seen` resume.
+2. Pre-tokenize FineWeb-Edu `sample-10BT` on a CPU machine
+   (`scripts/pretokenize.py`), then train with
+   `configs/iarmx_100m_pretrain_memmap.yaml` (`MEMMAP=1 bash scripts/train_100m.sh`).
 3. Fix the attention head dim (pad 65 → 72 or use FlexAttention) and confirm
    which SDPA backend runs.
 4. Run a μP proxy sweep (~$1–2), then a pilot (1%). Pick the GPU by measured
