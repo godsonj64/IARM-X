@@ -1,90 +1,38 @@
-# Review status: data-pipeline fix (commit 41b56d9)
+# Review status: data-pipeline fix
 
-Snapshot saved 2026-10-09 while the adversarial review was still running.
-Delete this file once the findings below are resolved.
+Adversarial review of commit `41b56d9` (truncation fix, exact resume): four
+reviewers (resume/checkpoint, data correctness, scale/performance,
+tests/docs/packaging), each followed by a skeptic who tried to refute every
+finding by running code. The fixes are in the commit that adds this table.
+Delete this file once you have read it.
 
-## What is already done and pushed
+## Findings and resolutions
 
-| Commit | Content |
-|---|---|
-| `ed727f3` | Exact chunkwise-parallel recurrent scan (81–89× fewer GPU ops per step) |
-| `38e65ef` | Cost analysis `docs/TRAINING_BUDGET.md`, `scripts/estimate_cost.py`, `scripts/bench_scan.py` |
-| `41b56d9` | Data pipeline: no truncation, `scripts/pretokenize.py`, `dataset: memmap`, exact resume (62/62 tests) |
+| # | Finding | Skeptic | Resolution |
+|---|---|---|---|
+| P1 | `pretokenize.py` main process buffered worker results without limit (2.7 GB in 11 s with 24 fast workers) | confirmed | Workers return `uint16` arrays with EOS inserted; at most 2× `--num-proc` batches in flight; reads only the text column. The same 24-worker repro now peaks at 1.2 GB with a backlog of 0 |
+| R1 | Streaming checkpoint resumed into a memmap config saved a wrong window position | confirmed | The saved position counts only windows drawn from the sampler; a memmap checkpoint resumed with a streaming config says so |
+| R2 | Resuming on a different GPU count made the LR jump (step-based horizon) | confirmed | With `target_tokens`, cosine decay follows tokens seen; warns when the global batch changes |
+| D2 | Streaming runs hit `target_tokens` at ~56% of the LR schedule (pre-existing) | confirmed | Token-based decay (as R2), and streaming now packs fixed `seq_len` rows, so every micro-batch has the same shape and token count |
+| D3 | Map-style data under DDP joined document pieces without EOS | confirmed | Documents are packed into rows inside the dataset (no pieces to reorder) |
+| R3 | Streaming with `num_workers: 0` re-applied the resume point at every new pass | confirmed | The HF resume state is cleared before each new pass; test fails without the fix |
+| R4 | Changing `num_workers` crashed with a bare `AssertionError` | confirmed | Clear error naming the saved value |
+| R5 | `--resume` refused when the config sets `training.init_from` (SFT configs) | confirmed | A config-level `init_from` is ignored when resuming |
+| R6 | Checkpoints written non-atomically and never pruned (~180 GB for 10B tokens) | confirmed | Atomic write (`.tmp` + fsync + rename); `keep_last: 3` in the 100M pretraining configs |
+| R7 | `train_100m.sh` never resumed | confirmed | `--resume auto` picks the newest checkpoint; the script uses it |
+| D4 | Literal `<\|endoftext\|>` / `<\|user\|>` in text became EOS / control tokens | confirmed | `split_special_tokens=True` in pre-tokenization, streaming and SFT rendering |
+| D5 | Memmap silently repeats data when `target_tokens` exceeds the shards; README pilot pointed at the 10B path | confirmed | Startup warning with the repeat factor; README pilot uses its own directory and `target_tokens` |
+| T1 | Bit-exact resume test passed even if `--resume` were ignored | pending | Each resumed run must not re-save the checkpoint it resumed from |
+| T2 | Multi-GPU map-style resume (sampler epoch) untested | pending | 2-process DDP map-style test resuming inside epoch 2 |
+| T3 | Streaming with workers crashed on Python 3.14 (forkserver) | pending | Tokenization is a module-level function; streaming and map-style resume tests pass under forced forkserver |
+| T4 | Docs overclaimed "bit-for-bit" (GPU kernels, GPU-count change) | pending | Reworded: bit-for-bit on CPU with the same GPU count; same data and RNG on GPU |
+| S1 | Scale review: P1 depends on reader speed; read only the text column | pending | Covered by P1 |
 
-## Review progress
+The scale/performance review found no other issue at 10B-token scale. The
+sampler's permutation takes 1.6 s and 156 MB per rank per epoch, and window
+reads run at ~41M tokens/s per process, about 100× what a GPU consumes.
 
-Four reviewers (data correctness, resume/checkpoint, scale/performance,
-tests/docs/packaging), each followed by a skeptic who tries to refute the
-findings by running code.
+## Test status
 
-| Reviewer | State |
-|---|---|
-| resume-checkpoint | **finished**: 7 findings below (not yet through the skeptic) |
-| data-correctness | was still running; one finding reproduced in its notes (P1) |
-| scale-performance | was running |
-| tests-docs-packaging | not started |
-
-None of the findings below affects the parallel scan or the cost estimates.
-
-## Findings so far, in planned fix order
-
-Line numbers refer to commit `41b56d9`.
-
-**P1. `scripts/pretokenize.py` can run out of RAM** (data-correctness, medium, reproduced by the reviewer).
-Worker processes return Python lists of ints and nothing bounds how many
-results queue in the main process. With a fast tokenizer the reviewer measured
-memory growing ~120 MB/s, peaking at 9 GB for 300M tokens, which would exhaust
-RAM long before 10B.
-*Fix:* workers return compact `uint16` arrays with EOS already inserted, and
-cap in-flight batches (a semaphore around the `imap` input) at about 2× `--num-proc`.
-
-**R1. Switching a run from streaming to memmap corrupts the saved position** (medium, reproduced). `train.py:330`
-saves `position = examples_seen`. After resuming a streaming checkpoint into a
-memmap config, the sampler starts at 0 but `examples_seen` doesn't, so the
-*next* resume skips windows.
-*Fix:* save the sampler's own position (`examples_seen - base`, where `base`
-is the resumed `examples_seen` minus the saved start), or refuse cross-pipeline
-resume. Also print a message when a memmap checkpoint is resumed with a
-streaming config.
-
-**R2. Resuming on a different GPU count changes the learning-rate schedule** (medium, reproduced). `train.py:246`
-The scheduler horizon depends on world size. The data position is exact, but
-with the same per-GPU batch settings the global batch and the cosine LR position
-jump (1 → 2 GPUs at step 50k: LR 4.8e-4 → 2.1e-4).
-*Fix:* keep the global batch constant by adjusting `grad_accum` automatically
-(error if it doesn't divide), or store the scheduler horizon in the checkpoint.
-Fix the README/TRAINING_BUDGET wording "exactly even on a different number of GPUs".
-
-**R3. Streaming with `num_workers: 0` re-applies the resume point at every new pass** (low, reproduced). `train.py:380`
-The HF dataset keeps the loaded state, so after an epoch wrap the stream restarts
-from the checkpoint position instead of the beginning. `num_workers >= 1` (the
-shipped configs use 2) is unaffected.
-*Fix:* clear the dataset's start state (`loader.dataset.load_state_dict(None)`)
-before re-iterating, and add a `num_workers=0` wrap-after-resume test.
-
-**R4. Changing `num_workers` between runs crashes with a bare `AssertionError`** (low, reproduced). `train.py:309`
-*Fix:* store `num_workers` in the data state and raise a clear message.
-
-**R5. README says SFT resumes, but SFT configs set `training.init_from`, which makes `--resume` raise** (low, reproduced). `train.py:227`
-*Fix:* with `--resume`, ignore a config-level `init_from`; reject only the CLI flag combination.
-
-**R6. Checkpoints are written non-atomically and never pruned** (low, pre-existing). `checkpoint.py:20`
-A preemption mid-write leaves a corrupt newest checkpoint. Keeping every
-`step-N.pt` is ~180 GB for a 10B-token 100M run.
-*Fix:* write to `.tmp`, then `os.replace`. Keep the last K step checkpoints.
-
-**R7. `scripts/train_100m.sh` never passes `--resume`** (low). Rerunning it after a preemption restarts at step 0 and overwrites checkpoints.
-*Fix:* auto-detect the newest intact checkpoint in `output_dir` and pass `--resume`.
-
-## Open question for the user
-
-Raise the default training context from 512 to 2048 tokens (pretraining and
-SFT)? It costs about 2% more compute for IARM-X and lets chats run to roughly
-1,500 words instead of ~380.
-
-## How to continue in a new session
-
-Check out branch `claude/eloquent-dirac-9cqy7j` and ask Claude to "fix the
-findings in docs/REVIEW_STATUS.md, then re-run an adversarial review of the
-remaining lenses (scale/performance, tests/docs/packaging)". Run the suite
-offline with `pip install -e '.[dev]' && pytest -q`.
+70/70 tests pass. CI-equivalent compile, smoke-test and parameter-count checks
+pass, and all changed files parse as Python 3.11.

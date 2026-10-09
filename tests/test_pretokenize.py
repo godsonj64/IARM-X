@@ -20,7 +20,7 @@ class FakeTokenizer:
     def __len__(self):
         return VOCAB
 
-    def __call__(self, texts, add_special_tokens=False):
+    def __call__(self, texts, add_special_tokens=False, split_special_tokens=False):
         return {"input_ids": [[ord(c) for c in t] for t in texts]}
 
 
@@ -61,6 +61,11 @@ def test_pretokenize_keeps_whole_documents_in_order(tmp_path, monkeypatch, num_p
     assert TokenWindows(tmp_path, seq_len=64)[0]["input_ids"].tolist() == expected[:64]
 
 
-def test_pretokenize_max_tokens_stops_early(tmp_path, monkeypatch):
-    index = run_script(tmp_path, 1, monkeypatch, extra=("--max-tokens", "6000"))
+@pytest.mark.parametrize("num_proc", [1, 2])
+def test_pretokenize_max_tokens_stops_early(tmp_path, monkeypatch, num_proc):
+    # With worker processes this also checks that stopping early releases the
+    # in-flight throttle, so terminating the pool cannot hang.
+    if num_proc > 1 and multiprocessing.get_start_method() != "fork":
+        pytest.skip("worker processes only inherit the fake tokenizer under fork")
+    index = run_script(tmp_path, num_proc, monkeypatch, extra=("--max-tokens", "6000"))
     assert 6000 <= index["tokens"] < 6000 + 7 * 5001

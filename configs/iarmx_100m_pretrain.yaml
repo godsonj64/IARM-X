@@ -48,4 +48,5 @@ training:
   num_workers: 2
   log_every: 10
   save_every: 1000
+  keep_last: 3             # older step-N.pt files are deleted (~1.2 GB each)
   output_dir: checkpoints/iarmx-100m-pretrain

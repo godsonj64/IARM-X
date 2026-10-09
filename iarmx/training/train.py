@@ -16,16 +16,38 @@ from ..config import IARMXConfig
 from ..model.model import IARMXForCausalLM
 from ..data.tokenizer import load_tokenizer
 from ..data.memmap import TokenWindows, WindowSampler
-from ..data.pretrain import build_pretrain_dataset, collate_pretrain
+from ..data.pretrain import build_pretrain_dataset, collate_rows
 from ..data.sft import build_sft_dataset, collate_sft
-from .checkpoint import save_checkpoint, load_checkpoint, unwrap_model
+from .checkpoint import (
+    latest_checkpoint,
+    load_checkpoint,
+    prune_checkpoints,
+    save_checkpoint,
+    unwrap_model,
+)
+
+
+def warmup_cosine(step, warmup, progress, min_ratio):
+    """Linear warmup over ``warmup`` steps, then cosine decay over ``progress`` in [0, 1]."""
+    if step < warmup:
+        return max(step / max(warmup, 1), 1e-8)
+    p = min(1.0, max(0.0, progress))
+    return min_ratio + (1 - min_ratio) * 0.5 * (1 + math.cos(math.pi * p))
 
 
 def cosine_with_warmup(step, warmup, total, min_ratio):
-    if step < warmup:
-        return max(step / max(warmup, 1), 1e-8)
-    p = min(1.0, (step - warmup) / max(total - warmup, 1))
-    return min_ratio + (1 - min_ratio) * 0.5 * (1 + math.cos(math.pi * p))
+    return warmup_cosine(step, warmup, (step - warmup) / max(total - warmup, 1), min_ratio)
+
+
+def clear_stream_resume_point(dataset):
+    """A Hugging Face IterableDataset re-applies a loaded resume state on every new
+    pass of the same epoch; once the resumed pass ends, the next must start at 0."""
+    try:
+        from datasets import IterableDataset
+    except ImportError:
+        return
+    if isinstance(dataset, IterableDataset):
+        dataset.load_state_dict(None)
 
 
 def setup_dist():
@@ -104,6 +126,7 @@ def capture_data_state(loader, sampler_epoch, memmap_position, world):
     if memmap_position is None:
         local["loader"] = loader.state_dict()
         local["epoch"] = sampler_epoch
+        local["num_workers"] = loader.num_workers
     ranks = [local]
     if world > 1:
         ranks = [None] * world
@@ -164,7 +187,11 @@ def should_stop(step, tokens_seen, examples_seen, train_cfg, dataset_len=None):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
-    ap.add_argument("--resume", help="training checkpoint .pt to resume")
+    ap.add_argument(
+        "--resume",
+        help="training checkpoint .pt to resume, or 'auto' for the newest checkpoint in "
+        "output_dir (starts fresh when there is none)",
+    )
     ap.add_argument(
         "--init-from",
         help="model directory from save_pretrained(); starts a new optimizer/scheduler",
@@ -178,6 +205,11 @@ def main():
     world, rank, device = setup_dist()
     seed = train.get("seed", 42)
     torch.manual_seed(seed + rank)
+    if args.resume == "auto":
+        found = latest_checkpoint(train.get("output_dir", "checkpoints"))
+        args.resume = str(found) if found is not None else None
+        if rank == 0:
+            print(f"--resume auto: {args.resume or 'no checkpoint found, starting fresh'}", flush=True)
 
     tok = load_tokenizer(data_cfg.get("tokenizer", "gpt2"))
     cfg.vocab_size = len(tok)
@@ -204,6 +236,14 @@ def main():
                 f"token shards use a vocabulary of {ds.vocab_size} but the tokenizer has {len(tok)}"
             )
         collate = None  # windows are already fixed-length tensors
+        target = train.get("target_tokens")
+        if target is not None and int(target) > ds.n_windows * ds.seq_len and rank == 0:
+            print(
+                f"warning: target_tokens={int(target):,} exceeds the {ds.n_windows * ds.seq_len:,} "
+                f"tokens in {data_cfg['path']}; the data will be repeated "
+                f"{int(target) / (ds.n_windows * ds.seq_len):.1f} times",
+                flush=True,
+            )
     else:
         ds = build_pretrain_dataset(
             tok,
@@ -213,19 +253,17 @@ def main():
             data_cfg["seq_len"],
             streaming,
             data_files=data_files,
-        )
-        collate = partial(
-            collate_pretrain,
-            pad_id=tok.pad_token_id,
-            seq_len=data_cfg["seq_len"],
             pack=data_cfg.get("pack", True),
         )
+        collate = collate_rows
 
     dataset_len = None if streaming else len(ds)
 
-    init_from = args.init_from or train.get("init_from")
-    if args.resume and init_from:
+    if args.resume and args.init_from:
         raise ValueError("use either --resume or --init-from, not both")
+    # A config-level init_from only seeds a fresh stage; a resumed checkpoint
+    # already holds the weights.
+    init_from = args.init_from or (None if args.resume else train.get("init_from"))
     if init_from:
         base_model = IARMXForCausalLM.from_pretrained(init_from, device=device)
         loaded = base_model.cfg.to_dict()
@@ -245,12 +283,21 @@ def main():
     )
     total = estimate_total_steps(train, data_cfg, world, dataset_len)
     min_ratio = train.get("min_lr", train["lr"] * 0.1) / train["lr"]
-    sched = LambdaLR(
-        optimizer,
-        lambda s: cosine_with_warmup(
-            s, train.get("warmup_steps", 0), total, min_ratio
-        ),
-    )
+    warmup = int(train.get("warmup_steps", 0))
+    target_tokens = train.get("target_tokens")
+    # With a token budget the decay follows tokens, not steps: tokens per step vary
+    # with document packing and with the number of GPUs, so a step-based horizon
+    # would end the run before (or after) the schedule does.
+    schedule = {"tokens": 0, "warmup_tokens": 0 if warmup == 0 else None}
+
+    def lr_lambda(s):
+        if target_tokens is None or s < warmup:
+            return cosine_with_warmup(s, warmup, total, min_ratio)
+        start = schedule["warmup_tokens"] or 0
+        progress = (schedule["tokens"] - start) / max(int(target_tokens) - start, 1)
+        return warmup_cosine(s, warmup, progress, min_ratio)
+
+    sched = LambdaLR(optimizer, lr_lambda)
 
     step = 0
     tokens_seen = 0
@@ -263,6 +310,19 @@ def main():
         tokens_seen = int(extra.get("tokens_seen", 0))
         examples_seen = int(extra.get("examples_seen", 0))
         data_state = extra.get("data")
+        schedule["tokens"] = tokens_seen
+        if extra.get("warmup_tokens") is not None:
+            schedule["warmup_tokens"] = int(extra["warmup_tokens"])
+        elif step >= warmup:  # checkpoint predates token-based decay
+            schedule["warmup_tokens"] = tokens_seen * warmup // max(step, 1)
+        saved_batch = extra.get("global_batch")
+        global_batch = int(train["micro_batch_size"]) * int(train.get("grad_accum", 1)) * world
+        if saved_batch is not None and saved_batch != global_batch and rank == 0:
+            print(
+                f"warning: global batch changed from {saved_batch} to {global_batch} sequences "
+                "per step (micro_batch_size x grad_accum x GPUs); set grad_accum to keep it",
+                flush=True,
+            )
         if rank == 0:
             print(
                 f"resumed={args.resume} step={step} tokens={tokens_seen} examples={examples_seen}",
@@ -272,6 +332,7 @@ def main():
     # The loader is built after resume so it can start at the saved data position.
     sampler = None
     memmap_spec = None
+    memmap_base = 0
     if memmap:
         # Every row is one window, so the global data position is examples_seen.
         memmap_spec = {
@@ -292,6 +353,9 @@ def main():
             start = int(saved["position"])
         elif args.resume and rank == 0:
             print("checkpoint has no token-window position; data starts at window 0", flush=True)
+        # examples_seen may include rows from an earlier non-memmap stage; the
+        # saved position must count only windows drawn from this sampler.
+        memmap_base = examples_seen - start
         sampler = WindowSampler(
             ds.n_windows, start, world, rank, memmap_spec["shuffle"], memmap_spec["seed"]
         )
@@ -299,10 +363,27 @@ def main():
 
     sampler_epoch = 0
     rng_state = None
-    if data_state is not None and data_state.get("world") == world:
+    saved_world = None if data_state is None else data_state.get("world")
+    if data_state is not None and not memmap and "loader" not in data_state["ranks"][0]:
+        if rank == 0:
+            print(
+                "checkpoint came from a token-shard (memmap) run; this run's data starts "
+                "from the beginning",
+                flush=True,
+            )
+        if saved_world == world:
+            rng_state = data_state["ranks"][rank]
+    elif data_state is not None and saved_world == world:
         local = data_state["ranks"][rank]
         rng_state = local
-        if not memmap and "loader" in local:
+        if not memmap:
+            saved_workers = local.get("num_workers", loader.num_workers)
+            if saved_workers != loader.num_workers:
+                raise ValueError(
+                    f"checkpoint data-loader state was saved with num_workers={saved_workers}, "
+                    f"now {loader.num_workers}: set num_workers back to {saved_workers} to resume "
+                    "exactly, or start a new stage with --init-from."
+                )
             sampler_epoch = int(local["epoch"])
             if sampler is not None:
                 sampler.set_epoch(sampler_epoch)
@@ -327,10 +408,14 @@ def main():
         )
 
     def data_extra():
-        position = None if memmap_spec is None else {**memmap_spec, "position": examples_seen}
+        position = None
+        if memmap_spec is not None:
+            position = {**memmap_spec, "position": examples_seen - memmap_base}
         return {
             "tokens_seen": tokens_seen,
             "examples_seen": examples_seen,
+            "warmup_tokens": schedule["warmup_tokens"],
+            "global_batch": int(train["micro_batch_size"]) * grad_accum * world,
             "data": capture_data_state(loader, sampler_epoch, position, world),
         }
 
@@ -348,6 +433,7 @@ def main():
     )
     grad_accum = int(train.get("grad_accum", 1))
     save_every = int(train.get("save_every", 1000))
+    keep_last = int(train.get("keep_last", 0))
     out_dir = Path(train.get("output_dir", "checkpoints"))
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -377,6 +463,7 @@ def main():
                 sampler_epoch += 1
                 if sampler is not None:
                     sampler.set_epoch(sampler_epoch)
+                clear_stream_resume_point(loader.dataset)
                 iterator = iter(loader)
                 batch = next(iterator)
 
@@ -404,11 +491,13 @@ def main():
         torch.nn.utils.clip_grad_norm_(model.parameters(), train.get("grad_clip", 1.0))
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
-        sched.step()
         step += 1
-
         tokens_seen += allreduce_int(local_tokens, device, world)
         examples_seen += allreduce_int(local_examples, device, world)
+        schedule["tokens"] = tokens_seen
+        if schedule["warmup_tokens"] is None and step >= warmup:
+            schedule["warmup_tokens"] = tokens_seen
+        sched.step()  # sets the learning rate for the next step
 
         if rank == 0 and step % int(train.get("log_every", 10)) == 0:
             print(
@@ -420,6 +509,7 @@ def main():
             extra = data_extra()  # collective: every rank must reach it
             if rank == 0:
                 save_checkpoint(out_dir / f"step-{step}.pt", model, optimizer, sched, step, extra)
+                prune_checkpoints(out_dir, keep_last)
 
     extra = data_extra()
     if rank == 0:

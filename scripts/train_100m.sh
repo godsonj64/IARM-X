@@ -22,12 +22,16 @@ if [[ "$MEMMAP" == "1" ]]; then
   PRETRAIN_CONFIG="configs/iarmx_100m_pretrain_memmap.yaml"
 fi
 
+# --resume auto continues from the newest checkpoint in the stage's output_dir
+# (exact data position), so rerunning this script after a preemption picks up
+# where it stopped; a finished stage exits immediately. Delete output_dir to
+# start a stage over.
 run_train () {
   local cfg="$1"
   if [[ "$NPROC" -gt 1 ]]; then
-    torchrun --standalone --nproc_per_node="$NPROC" -m iarmx.training.train --config "$cfg"
+    torchrun --standalone --nproc_per_node="$NPROC" -m iarmx.training.train --config "$cfg" --resume auto
   else
-    python -m iarmx.training.train --config "$cfg"
+    python -m iarmx.training.train --config "$cfg" --resume auto
   fi
 }
 

@@ -376,12 +376,17 @@ background thread to push $\delta$ toward 0.
 Section 2's `--resume` used to replay the stream from the start. Under
 preemption that is a hidden tax: you pay for duplicate tokens and never see the
 tail of the data. Checkpoints now carry the exact data position and every
-rank's RNG state. With pre-tokenized shards the position is one integer (global
-windows consumed), so a run resumes exactly even on a different number of GPUs.
-Streaming and SFT runs store `StatefulDataLoader` state and resume exactly on
-the same GPU count. Either way, a resumed run matches the uninterrupted one
-bit-for-bit (`tests/test_resume.py`), so a preemption costs only the work since
-the last checkpoint.
+rank's RNG state, are written atomically, and `--resume auto` (used by
+`scripts/train_100m.sh`) picks the newest one, so rerunning the same command
+after a preemption continues the run. With pre-tokenized shards the position is
+one integer (global windows consumed), so the data continues exactly even on a
+different number of GPUs, and the learning rate follows tokens seen, so it does
+not jump. Streaming and SFT runs store `StatefulDataLoader` state and resume
+exactly with the same GPU count. With the same GPU count a resumed run matches
+the uninterrupted one bit-for-bit on CPU (`tests/test_resume.py`); on GPUs it
+sees the same data and RNG streams but is subject to ordinary CUDA kernel
+nondeterminism. Either way a preemption costs only the work since the last
+checkpoint.
 
 ### 7.5 Real options and the value of information
 

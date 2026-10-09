@@ -196,7 +196,9 @@ python scripts/pretokenize.py --out data/tokens/fineweb-edu-10bt-gpt2 --num-proc
 MEMMAP=1 bash scripts/train_100m.sh
 ```
 
-`scripts/pretokenize.py` keeps every document whole (no truncation), appends one EOS per document and writes about 20 GB of `uint16` token shards plus an `index.json`. It runs on CPU, so do it before renting a GPU. `configs/iarmx_100m_pretrain_memmap.yaml` trains on fixed 512-token windows read from those shards; every token is a training target exactly once per epoch and no compute is spent on padding. Add `--data-files "data/raw/fineweb-edu-10bt/sample/10BT/*.parquet"` to tokenize the local copy from `scripts/download_datasets.py` instead of streaming from the Hub, or `--max-tokens 100000000` for a pilot run.
+`scripts/pretokenize.py` keeps every document whole (no truncation), appends one EOS per document and writes about 20 GB of `uint16` token shards plus an `index.json`. It runs on CPU, so do it before renting a GPU. `configs/iarmx_100m_pretrain_memmap.yaml` trains on fixed 512-token windows read from those shards; every token is a training target exactly once per epoch and no compute is spent on padding. Add `--data-files "data/raw/fineweb-edu-10bt/sample/10BT/*.parquet"` to tokenize the local copy from `scripts/download_datasets.py` instead of streaming from the Hub.
+
+For a pilot, write a small shard set to its own directory (`--max-tokens 100000000 --out data/tokens/pilot`) and point a copy of the config at it with `path: data/tokens/pilot` and a matching `target_tokens` (for example `100000000`). If `target_tokens` exceeds the tokens in the shard set, training repeats the data and prints a warning at startup saying how many times.
 
 ### Stream FineWeb-Edu directly
 
@@ -204,7 +206,7 @@ MEMMAP=1 bash scripts/train_100m.sh
 python -m iarmx.training.train --config configs/iarmx_100m_pretrain.yaml
 ```
 
-Streaming tokenizes on the fly. Documents longer than `4 × seq_len` tokens are split into consecutive pieces, not truncated.
+Streaming tokenizes on the fly and packs documents into fixed `seq_len` rows, one EOS after each document; nothing is truncated, and `micro_batch_size` counts rows, so every micro-batch has the same shape. Literal special-token strings in the text (`<|endoftext|>`, `<|user|>`, ...) stay ordinary text in both pipelines.
 
 ### Download datasets once
 
@@ -300,7 +302,7 @@ torchrun --standalone --nproc_per_node=8 -m iarmx.training.train \
   --config configs/iarmx_100m_pretrain.yaml
 ```
 
-The trainer includes BF16 autocast, FP32 persistent recurrent state, packed document collation, gradient accumulation, AdamW parameter groups, cosine decay with warmup, gradient clipping, DDP data partitioning, DDP `no_sync()` during accumulation, gradient checkpointing, checkpointing, optional `torch.compile`, and resumable optimizer/scheduler/step state.
+The trainer includes BF16 autocast, FP32 persistent recurrent state, packed fixed-length rows, gradient accumulation, AdamW parameter groups, cosine decay with warmup (with `target_tokens` the decay follows tokens seen, so it ends exactly at the token budget whatever the GPU count), gradient clipping, DDP data partitioning, DDP `no_sync()` during accumulation, gradient checkpointing, checkpointing, optional `torch.compile`, and resumable optimizer/scheduler/step state.
 
 ### Resume a run
 
@@ -310,12 +312,14 @@ iarmx-train \
   --resume checkpoints/iarmx-100m-pretrain/step-10000.pt
 ```
 
+`--resume auto` picks the newest checkpoint in the config's `output_dir` (or starts fresh if there is none); `scripts/train_100m.sh` uses it, so rerunning the script after a preemption continues where it stopped. Checkpoints are written atomically, and `keep_last: 3` in the 100M pretraining configs deletes older `step-N.pt` files (about 1.2 GB each).
+
 `--resume` restores model, optimizer, scheduler, step, tracked training counters, each rank's RNG streams and the exact data position, so a resumed run continues with the next unseen batch instead of replaying data:
 
-- `dataset: memmap` stores the global window position; it resumes exactly even on a different number of GPUs.
-- Streaming and map-style datasets (including SFT) store each rank's `StatefulDataLoader` state; they resume exactly on the same number of GPUs and refuse to resume on a different one rather than replay data.
+- `dataset: memmap` stores the global window position, so the data continues exactly even on a different number of GPUs. Keep `micro_batch_size x grad_accum x GPUs` constant in that case (the trainer warns if it changes); the learning rate follows tokens seen, so it does not jump.
+- Streaming and map-style datasets (including SFT) store each rank's `StatefulDataLoader` state; they resume exactly with the same number of GPUs and `num_workers`, and refuse to resume otherwise rather than replay data.
 
-With the same GPU count, a resumed run reproduces the uninterrupted run bit-for-bit (`tests/test_resume.py`). `--init-from` loads pretrained model weights into a fresh training stage, starting its data from the beginning.
+With the same GPU count and settings, a resumed run reproduces the uninterrupted run bit-for-bit on CPU (`tests/test_resume.py`). On GPUs it sees the same data in the same order with the same RNG streams, but CUDA kernels are not bitwise deterministic, so weights match only approximately (as between any two GPU runs); after a GPU-count change the RNG streams are reseeded. `--init-from` loads pretrained model weights into a fresh training stage, starting its data from the beginning; with `--resume`, a config-level `init_from` is ignored because the checkpoint already holds the weights.
 
 ## Generation
 
@@ -358,8 +362,8 @@ python -m compileall -q iarmx scripts tests
 The current documented regression suite passes **62/62 tests** and covers:
 
 - chunkwise-parallel vs per-token recurrent scan parity (outputs, state, gradients, cached decoding);
-- bit-exact resume for token-shard, streaming and map-style data (0 and 2 loader workers, epoch wrap, 2-process DDP) and token-shard resume on a different world size;
-- pre-tokenization without truncation, token-window/label alignment across shards, and long-document splitting with one boundary token per document;
+- bit-exact resume on CPU for token-shard, streaming and map-style data (0 and 2 loader workers, epoch wraps before and after the resume point, 2-process DDP), token-shard resume on a different world size, `--resume auto`, atomic and pruned checkpoints, and a token-budget schedule that ends at `min_lr`;
+- pre-tokenization without truncation (bounded memory, ordered multiprocessing), token-window/label alignment across shards, fixed-length packed rows with one EOS per document, and special-token strings kept as text;
 - full-vs-cached and arbitrary-chunk parity;
 - zero future-token leakage;
 - exact convolution-cache behavior;

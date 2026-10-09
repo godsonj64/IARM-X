@@ -26,7 +26,7 @@ class FakeTokenizer:
     def __len__(self):
         return VOCAB
 
-    def __call__(self, texts, add_special_tokens=False):
+    def __call__(self, texts, add_special_tokens=False, split_special_tokens=False):
         return {"input_ids": [[1 + ord(c) % (VOCAB - 1) for c in t] for t in texts]}
 
 
@@ -44,25 +44,28 @@ def write_shards(path):
     writer.close()
 
 
+def _fake_stream(shards, n):
+    # Module level so DataLoader workers can pickle it under spawn/forkserver too.
+    texts = make_texts(n)
+    for s in shards:
+        for i in range(s, len(texts), 4):
+            yield {"text": texts[i], "id": i}
+
+
 def fake_load_dataset(name, config=None, split=None, streaming=False, data_files=None):
+    """``name`` is "fake" (40 documents) or "fake:N" (N documents)."""
     from datasets import Dataset, IterableDataset
 
-    texts = make_texts()
+    n = int(name.split(":")[1]) if ":" in name else 40
     if not streaming:
-        # 6 documents split into 9 pieces = 2.25 optimizer steps per epoch, so the
-        # step-3 checkpoint falls inside the second epoch.
-        return Dataset.from_list([{"text": t, "id": i} for i, t in enumerate(texts[:6])])
-
-    def gen(shards):
-        for s in shards:
-            for i in range(s, len(texts), 4):
-                yield {"text": texts[i], "id": i}
-
-    return IterableDataset.from_generator(gen, gen_kwargs={"shards": [0, 1, 2, 3]})
+        return Dataset.from_list([{"text": t, "id": i} for i, t in enumerate(make_texts(n))])
+    return IterableDataset.from_generator(
+        _fake_stream, gen_kwargs={"shards": [0, 1, 2, 3], "n": n}
+    )
 
 
 def write_config(path, out_dir, data, steps=6, save_every=3, dropout=0.1, workers=0,
-                 micro=2, accum=2):
+                 micro=2, accum=2, **training):
     spec = {
         "model": dict(vocab_size=VOCAB, dim=32, n_layers=2, n_heads=4, ffn_hidden=64,
                       max_seq_len=64, n_operators=2, operator_rank=4, fast_memory_rank=4,
@@ -70,10 +73,15 @@ def write_config(path, out_dir, data, steps=6, save_every=3, dropout=0.1, worker
         "data": dict(stage="pretrain", seq_len=16, **data),
         "training": dict(seed=0, micro_batch_size=micro, grad_accum=accum, max_steps=steps,
                          lr=3e-3, min_lr=3e-4, warmup_steps=2, compile=False, log_every=100,
-                         save_every=save_every, num_workers=workers, output_dir=str(out_dir)),
+                         save_every=save_every, num_workers=workers, output_dir=str(out_dir),
+                         **training),
     }
     path.write_text(yaml.safe_dump(spec))
     return path
+
+
+def load_ckpt(path):
+    return torch.load(path, weights_only=False)
 
 
 def run(config, resume=None):
@@ -105,8 +113,20 @@ def assert_same_weights(a, b, exact=True):
 DATA = {
     "memmap": lambda tmp: {"dataset": "memmap", "path": str(tmp / "tokens")},
     "streaming": lambda tmp: {"dataset": "fake", "streaming": True},
-    "map-style, epoch wrap": lambda tmp: {"dataset": "fake", "streaming": False},
+    # 1 document packs into 7 rows = 1.75 steps per epoch (2 on two ranks), so the
+    # step-3 checkpoint falls inside the second epoch; the tests assert this.
+    "map-style, epoch wrap": lambda tmp: {"dataset": "fake:1", "streaming": False},
 }
+
+
+def resume_and_compare(tmp_path, data, resume_step=3, **kw):
+    """Run a to completion, resume b from a's step checkpoint, compare finals."""
+    run(write_config(tmp_path / "a.yaml", tmp_path / "a", data, **kw))
+    run(write_config(tmp_path / "b.yaml", tmp_path / "b", data, **kw),
+        resume=tmp_path / "a" / f"step-{resume_step}.pt")
+    # b really resumed: it never re-ran (and so never re-saved) step resume_step.
+    assert not (tmp_path / "b" / f"step-{resume_step}.pt").exists()
+    assert_same_weights(final_weights(tmp_path / "a"), final_weights(tmp_path / "b"))
 
 
 @pytest.mark.parametrize("workers", [0, 2])
@@ -114,13 +134,71 @@ DATA = {
 def test_resume_matches_uninterrupted_run(tmp_path, kind, workers):
     write_shards(tmp_path / "tokens")
     data = DATA[kind](tmp_path)
-    run(write_config(tmp_path / "a.yaml", tmp_path / "a", data, workers=workers))
     if kind == "map-style, epoch wrap":
-        ckpt = torch.load(tmp_path / "a" / "step-3.pt", weights_only=False)
-        assert ckpt["extra"]["data"]["ranks"][0]["epoch"] >= 1
-    run(write_config(tmp_path / "b.yaml", tmp_path / "b", data, workers=workers),
+        run(write_config(tmp_path / "probe.yaml", tmp_path / "probe", data, workers=workers))
+        assert load_ckpt(tmp_path / "probe" / "step-3.pt")["extra"]["data"]["ranks"][0]["epoch"] >= 1
+    resume_and_compare(tmp_path, data, workers=workers)
+
+
+def test_streaming_without_workers_starts_later_passes_at_the_beginning(tmp_path):
+    # 8 documents = ~8 steps per pass, so the stream wraps twice after the resume.
+    resume_and_compare(tmp_path, {"dataset": "fake:8", "streaming": True}, steps=20, workers=0)
+
+
+def test_switching_from_streaming_to_memmap_saves_only_memmap_windows(tmp_path):
+    write_shards(tmp_path / "tokens")
+    run(write_config(tmp_path / "a.yaml", tmp_path / "a", DATA["streaming"](tmp_path)))
+    run(write_config(tmp_path / "b.yaml", tmp_path / "b", DATA["memmap"](tmp_path)),
         resume=tmp_path / "a" / "step-3.pt")
-    assert_same_weights(final_weights(tmp_path / "a"), final_weights(tmp_path / "b"))
+    ckpt = load_ckpt(tmp_path / "b" / "step-6.pt")
+    # Steps 4-6 drew 3 x (2 x 2) = 12 windows; examples_seen also counts stage a's rows.
+    assert ckpt["extra"]["data"]["memmap"]["position"] == 12
+    assert ckpt["extra"]["examples_seen"] > 12
+
+
+def test_changing_num_workers_is_refused_with_a_clear_error(tmp_path):
+    data = DATA["streaming"](tmp_path)
+    run(write_config(tmp_path / "a.yaml", tmp_path / "a", data, workers=0))
+    with pytest.raises(ValueError, match="num_workers"):
+        run(write_config(tmp_path / "b.yaml", tmp_path / "b", data, workers=2),
+            resume=tmp_path / "a" / "step-3.pt")
+
+
+def test_resume_auto_continues_a_stage_that_has_a_config_init_from(tmp_path):
+    write_shards(tmp_path / "tokens")
+    run(write_config(tmp_path / "a.yaml", tmp_path / "a", DATA["memmap"](tmp_path)))
+    stage2 = write_config(tmp_path / "b.yaml", tmp_path / "b", DATA["streaming"](tmp_path),
+                          init_from=str(tmp_path / "a" / "final"), keep_last=2)
+    run(stage2)
+    reference = final_weights(tmp_path / "b")
+    # Simulate a preemption right after step 3.
+    for name in ("step-6.pt", "last.pt"):
+        (tmp_path / "b" / name).unlink()
+    run(stage2, resume="auto")
+    assert_same_weights(reference, final_weights(tmp_path / "b"))
+    run(stage2, resume="auto")  # a finished stage resumes from last.pt and stops at once
+    assert_same_weights(reference, final_weights(tmp_path / "b"))
+
+
+def test_checkpoints_are_atomic_and_pruned(tmp_path):
+    write_shards(tmp_path / "tokens")
+    run(write_config(tmp_path / "a.yaml", tmp_path / "a", DATA["memmap"](tmp_path),
+                     save_every=2, keep_last=1))
+    assert sorted(p.name for p in (tmp_path / "a").glob("*.pt*")) == ["last.pt", "step-6.pt"]
+
+
+def test_token_budget_decays_to_min_lr_exactly_at_the_target(tmp_path):
+    write_shards(tmp_path / "tokens")
+    tokens_per_step = 2 * 2 * 16
+    cfg = write_config(tmp_path / "a.yaml", tmp_path / "a", DATA["memmap"](tmp_path), steps=None)
+    spec = yaml.safe_load(cfg.read_text())
+    spec["training"].pop("max_steps")
+    spec["training"]["target_tokens"] = 7 * tokens_per_step
+    cfg.write_text(yaml.safe_dump(spec))
+    run(cfg)
+    last = load_ckpt(tmp_path / "a" / "last.pt")
+    assert last["step"] == 7
+    assert last["optimizer"]["param_groups"][0]["lr"] == pytest.approx(3e-4)
 
 
 def test_resume_without_data_state_diverges(tmp_path):
@@ -179,6 +257,17 @@ def test_ddp_resume_is_exact_and_memmap_survives_a_world_size_change(tmp_path):
     run(write_config(tmp_path / "c.yaml", tmp_path / "c", data, steps=4, save_every=2,
                      dropout=0.0, accum=2), resume=tmp_path / "a" / "step-2.pt")
     assert_same_weights(final_weights(tmp_path / "a"), final_weights(tmp_path / "c"), exact=False)
+
+
+def test_ddp_map_style_resume_restores_the_sampler_epoch(tmp_path):
+    data = DATA["map-style, epoch wrap"](tmp_path)
+    kw = dict(steps=6, save_every=3, accum=1)
+    run_ddp(2, write_config(tmp_path / "a.yaml", tmp_path / "a", data, **kw))
+    assert load_ckpt(tmp_path / "a" / "step-3.pt")["extra"]["data"]["ranks"][1]["epoch"] >= 1
+    run_ddp(2, write_config(tmp_path / "b.yaml", tmp_path / "b", data, **kw),
+            resume=tmp_path / "a" / "step-3.pt")
+    assert not (tmp_path / "b" / "step-3.pt").exists()
+    assert_same_weights(final_weights(tmp_path / "a"), final_weights(tmp_path / "b"))
 
 
 def test_ddp_streaming_resume_is_exact_and_refuses_a_world_size_change(tmp_path):

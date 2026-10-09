@@ -15,24 +15,44 @@ deterministic. See ``iarmx/data/memmap.py`` for the format.
 import argparse
 import itertools
 import os
+import threading
 import time
 from multiprocessing import Pool
 
-from iarmx.data.memmap import TokenShardWriter
+import numpy as np
+
+from iarmx.data.memmap import TokenShardWriter, token_dtype
+from iarmx.data.pretrain import encode_texts
 from iarmx.data.tokenizer import load_tokenizer
 
 _TOKENIZER = None
+_EOS = None
+_DTYPE = None
+
+
+def _eos_id(tok) -> int:
+    return tok.eos_token_id if tok.eos_token_id is not None else tok.pad_token_id
 
 
 def _init_worker(name: str):
-    global _TOKENIZER
+    global _TOKENIZER, _EOS, _DTYPE
     # Each worker is single-threaded; parallelism comes from the process pool.
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     _TOKENIZER = load_tokenizer(name)
+    _EOS, _DTYPE = _eos_id(_TOKENIZER), token_dtype(len(_TOKENIZER))
 
 
-def _encode(texts: list[str]) -> list[list[int]]:
-    return _TOKENIZER(texts, add_special_tokens=False)["input_ids"]
+def _encode(texts: list[str]) -> tuple[np.ndarray, int]:
+    """Tokenize a batch into one flat array (EOS after each non-empty document).
+
+    A shard-dtype array pickles at 2 bytes per GPT-2 token instead of ~30 for a
+    list of ints, which keeps the single writer process ahead of the workers.
+    The writer still range-checks every batch against the vocabulary.
+    """
+    docs = [ids for ids in encode_texts(_TOKENIZER, texts) if ids]
+    total = sum(len(ids) + 1 for ids in docs)
+    flat = itertools.chain.from_iterable(itertools.chain(ids, (_EOS,)) for ids in docs)
+    return np.fromiter(flat, dtype=_DTYPE, count=total), len(docs)
 
 
 def _batched(iterable, size: int):
@@ -48,7 +68,8 @@ def _texts(args):
         ds = load_dataset("parquet", data_files=args.data_files, split="train", streaming=True)
     else:
         ds = load_dataset(args.dataset, args.dataset_config, split=args.split, streaming=True)
-    for example in ds:
+    # Decoding only the text column makes the parquet reader ~3x faster.
+    for example in ds.select_columns([args.text_column]):
         yield example[args.text_column]
 
 
@@ -68,7 +89,7 @@ def main():
     args = ap.parse_args()
 
     tok = load_tokenizer(args.tokenizer)
-    eos = tok.eos_token_id if tok.eos_token_id is not None else tok.pad_token_id
+    eos = _eos_id(tok)
     source = {"data_files": args.data_files} if args.data_files else {
         "dataset": args.dataset, "dataset_config": args.dataset_config, "split": args.split,
     }
@@ -79,19 +100,31 @@ def main():
 
     batches = _batched(_texts(args), args.batch_size)
     pool = None
+    # Pool.imap queues finished batches without limit; cap the batches in flight
+    # so a slow writer cannot make the main process hold the whole dataset.
+    inflight, stop = threading.Semaphore(2 * args.num_proc), threading.Event()
+
+    def throttled():
+        for batch in batches:
+            inflight.acquire()
+            if stop.is_set():
+                return
+            yield batch
+
     if args.num_proc > 1:
         pool = Pool(args.num_proc, initializer=_init_worker, initargs=(args.tokenizer,))
-        encoded = pool.imap(_encode, batches)  # imap preserves input order
+        encoded = pool.imap(_encode, throttled())  # imap preserves input order
     else:
-        global _TOKENIZER
-        _TOKENIZER = tok  # keep the tokenizer's own multithreaded batch encoding
+        global _TOKENIZER, _EOS, _DTYPE
+        # Keep the tokenizer's own multithreaded batch encoding.
+        _TOKENIZER, _EOS, _DTYPE = tok, eos, token_dtype(len(tok))
         encoded = map(_encode, batches)
 
     t0 = last = time.perf_counter()
     try:
-        for docs in encoded:
-            for ids in docs:
-                writer.add_document(ids)
+        for tokens, n_docs in encoded:
+            writer.add_tokens(tokens, n_docs)
+            inflight.release()
             now = time.perf_counter()
             if now - last > 30:
                 rate = writer.tokens / (now - t0)
@@ -101,6 +134,8 @@ def main():
                 break
     finally:
         if pool is not None:
+            stop.set()
+            inflight.release()  # unblock the pool's feeder thread so terminate() can join it
             pool.terminate()
     index = writer.close()
     print(

@@ -69,12 +69,19 @@ class TokenShardWriter:
         arr = np.asarray(ids, dtype=np.int64)
         if arr.size == 0:
             return 0
+        return self.add_tokens(np.append(arr, self.eos_id), documents=1)
+
+    def add_tokens(self, tokens, documents: int) -> int:
+        """Append pre-joined documents (each already followed by its EOS)."""
+        arr = np.asarray(tokens)
+        if arr.size == 0:
+            return 0
         if arr.min() < 0 or arr.max() >= self.vocab_size:
             raise ValueError(f"token id outside [0, {self.vocab_size})")
-        arr = np.append(arr, self.eos_id).astype(self.dtype)
+        arr = arr.astype(self.dtype, copy=False)
         self._buffer.append(arr)
         self._buffered += arr.size
-        self.documents += 1
+        self.documents += int(documents)
         self.tokens += arr.size
         while self._buffered >= self.shard_tokens:
             self._flush(self.shard_tokens)
