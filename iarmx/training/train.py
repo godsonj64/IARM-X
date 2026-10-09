@@ -332,6 +332,12 @@ def main():
         return warmup_cosine(s, warmup, progress, min_ratio)
 
     sched = LambdaLR(optimizer, lr_lambda)
+    if warmup >= total and rank == 0:
+        print(
+            f"warning: warmup_steps={warmup} >= the run's {total} steps, so the learning rate "
+            "never reaches its peak or decays; lower training.warmup_steps",
+            flush=True,
+        )
 
     step = 0
     tokens_seen = 0

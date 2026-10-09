@@ -37,3 +37,17 @@ def test_notebook_references_existing_files_and_trainer_settings():
     assert {"output_dir", "target_tokens", "init_from", "precision"} <= keys
     for key in keys:
         assert f'"{key}"' in trainer, f"notebook sets training.{key}, which the trainer never reads"
+
+
+def test_notebook_run_helper_streams_logs_and_stops_on_failure(tmp_path, capsys):
+    import pytest
+
+    source = next(c for c in code_cells() if "def run(" in c)
+    namespace = {}
+    exec(source[source.index("import os, shlex, subprocess"):], namespace)
+    log = tmp_path / "train.log"
+    namespace["run"]("echo hello", log=str(log))
+    assert "hello" in capsys.readouterr().out
+    assert log.read_text() == "hello\n"
+    with pytest.raises(RuntimeError, match="exit code 3"):
+        namespace["run"]("exit 3")

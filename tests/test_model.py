@@ -185,3 +185,12 @@ def test_padded_batch_generation_matches_individual_generation():
     b = m.generate(p2[None], max_new_tokens=3, temperature=0.0).squeeze(0)
     assert torch.equal(batched[0, : a.numel()], a)
     assert torch.equal(batched[1, : b.numel()], b)
+
+
+def test_rope_angles_stay_fp32_when_the_model_is_cast_for_inference():
+    from iarmx.model.layers import RotaryEmbedding
+
+    positions = torch.arange(2048)
+    exact, _ = RotaryEmbedding(64, 2048).cos_sin(positions, torch.float32)
+    cast, _ = RotaryEmbedding(64, 2048).to(torch.bfloat16).cos_sin(positions, torch.float32)
+    assert torch.equal(cast, exact)

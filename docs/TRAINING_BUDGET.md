@@ -13,7 +13,11 @@ GPU (section 12 lists which is which).
 > the same 65,536 tokens per optimizer step. For IARM-X that adds only 2.2%
 > compute (102.5M → 104.8M forward MACs/token), so scale the 100M costs by
 > about 1.02. `python scripts/estimate_cost.py --config configs/iarmx_100m_pretrain.yaml`
-> prints the 2048 figures directly.
+> prints the 2048 figures directly. That count covers matmuls only. The two
+> attention layers also move O(T²) scores through memory, so their real cost
+> grows faster with context. Q/K are now zero-padded from 65 to 72 dims, which
+> makes PyTorch's memory-efficient SDPA kernel eligible on GPUs instead of the
+> math fallback. Treat the pilot's measured tokens/s as the ground truth.
 
 | Model | Training compute (10B tokens) | Energy floor | Estimated rental cost | Under $50? |
 |---|---:|---:|---:|---|

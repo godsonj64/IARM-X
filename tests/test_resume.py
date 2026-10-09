@@ -291,3 +291,10 @@ def test_command_line_overrides_reach_the_run(tmp_path):
                         "training.precision=auto"])
     assert load_ckpt(tmp_path / "b" / "last.pt")["step"] == 2
     assert not (tmp_path / "unused").exists()
+
+
+def test_warmup_longer_than_the_run_is_reported(tmp_path, capsys):
+    write_shards(tmp_path / "tokens")
+    run(write_config(tmp_path / "a.yaml", tmp_path / "a", DATA["memmap"](tmp_path), steps=2,
+                     save_every=2), overrides=["training.warmup_steps=5"])
+    assert "never reaches its peak" in capsys.readouterr().out

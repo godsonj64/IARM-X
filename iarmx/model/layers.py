@@ -31,12 +31,17 @@ class RotaryEmbedding(nn.Module):
         super().__init__()
         if dim % 2:
             raise ValueError("RoPE head dimension must be even")
-        inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.dim = dim
+        self.theta = theta
         self.max_seq_len = max_seq_len
 
     def cos_sin(self, positions: torch.Tensor, dtype: torch.dtype):
-        freqs = torch.einsum("...t,d->...td", positions.float(), self.inv_freq)
+        # Angles are always computed in FP32 and never stored as a module buffer:
+        # casting the model to fp16/bf16 for inference would otherwise round the
+        # frequencies, shifting angles by up to ~0.9 rad at position 2047.
+        exponent = torch.arange(0, self.dim, 2, device=positions.device, dtype=torch.float32)
+        inv_freq = 1.0 / (self.theta ** (exponent / self.dim))
+        freqs = positions.float().unsqueeze(-1) * inv_freq
         return freqs.cos().to(dtype), freqs.sin().to(dtype)
 
     @staticmethod

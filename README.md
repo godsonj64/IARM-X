@@ -23,15 +23,20 @@
 6. UltraChat chat-tuning;
 7. a chat with the model.
 
-Checkpoints go to Google Drive on Colab, and rerunning after a disconnect resumes exactly. The default `PLAN = "pilot"` (50M tokens) takes about an hour on a free T4. `PLAN = "full"` is the 10B-token run for an A100/H100-class GPU.
+Checkpoints go to Google Drive on Colab (only the newest is kept), and rerunning after a disconnect resumes exactly. The default `PLAN = "pilot"` (20M tokens plus 50 chat-tuning steps) takes about 1–2 hours on a free T4 and 15–30 minutes on an A100/H100, including downloads and data preparation. `PLAN = "full"` is the 10B-token run for an A100/H100-class GPU. A failed step stops the notebook with its error rather than running on.
+
+Until this work is merged, the notebook clones the `claude/eloquent-dirac-9cqy7j` branch; set `BRANCH = "main"` after merging.
 
 The same flow from a terminal:
 
 ```bash
-git clone https://github.com/godsonj64/IARM-X.git && cd IARM-X
+git clone -b claude/eloquent-dirac-9cqy7j https://github.com/godsonj64/IARM-X.git && cd IARM-X
 pip install -e '.[dev]'
+# a 20M-token pilot: short warmup, frequent checkpoints, prints tokens/s
 python -m iarmx.training.train --config configs/iarmx_100m_pretrain.yaml --resume auto \
-  --set training.target_tokens=50000000 --set training.precision=auto
+  --set training.target_tokens=20000000 --set training.warmup_steps=30 \
+  --set training.save_every=100 --set training.precision=auto \
+  --set training.output_dir=checkpoints/pilot
 ```
 
 `--set section.key=value` overrides any config value without editing the YAML.
