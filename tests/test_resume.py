@@ -84,13 +84,15 @@ def load_ckpt(path):
     return torch.load(path, weights_only=False)
 
 
-def run(config, resume=None):
+def run(config, resume=None, overrides=()):
     import datasets
 
     saved = train_mod.load_tokenizer, datasets.load_dataset, sys.argv
     train_mod.load_tokenizer = lambda name: FakeTokenizer()
     datasets.load_dataset = fake_load_dataset
     sys.argv = ["train", "--config", str(config)] + (["--resume", str(resume)] if resume else [])
+    for item in overrides:
+        sys.argv += ["--set", item]
     try:
         train_mod.main()
     finally:
@@ -280,3 +282,12 @@ def test_ddp_streaming_resume_is_exact_and_refuses_a_world_size_change(tmp_path)
     with pytest.raises(ValueError, match="same world size"):
         run(write_config(tmp_path / "c.yaml", tmp_path / "c", data, steps=4, accum=2),
             resume=tmp_path / "a" / "step-2.pt")
+
+
+def test_command_line_overrides_reach_the_run(tmp_path):
+    write_shards(tmp_path / "tokens")
+    cfg = write_config(tmp_path / "a.yaml", tmp_path / "unused", DATA["memmap"](tmp_path))
+    run(cfg, overrides=[f"training.output_dir={tmp_path / 'b'}", "training.max_steps=2",
+                        "training.precision=auto"])
+    assert load_ckpt(tmp_path / "b" / "last.pt")["step"] == 2
+    assert not (tmp_path / "unused").exists()

@@ -8,6 +8,13 @@ GPU (section 12 lists which is which).
 
 ## 0. Verdict
 
+> **Context-length update.** The tables below were computed at the original
+> 512-token training context. The shipped default is now **2048 tokens**, with
+> the same 65,536 tokens per optimizer step. For IARM-X that adds only 2.2%
+> compute (102.5M → 104.8M forward MACs/token), so scale the 100M costs by
+> about 1.02. `python scripts/estimate_cost.py --config configs/iarmx_100m_pretrain.yaml`
+> prints the 2048 figures directly.
+
 | Model | Training compute (10B tokens) | Energy floor | Estimated rental cost | Under $50? |
 |---|---:|---:|---:|---|
 | IARM-X 100M, ctx 512 | 6.15e18 FLOP | 2–19 kWh ≈ **$0.3–3** | **$5–15** | **Yes, with ample margin**, once the recurrent scan is parallel (done on this branch) |

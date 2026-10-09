@@ -2,6 +2,7 @@ import argparse
 from contextlib import nullcontext
 import math
 import os
+import time
 from functools import partial
 from pathlib import Path
 import numpy as np
@@ -18,6 +19,7 @@ from ..data.tokenizer import load_tokenizer
 from ..data.memmap import TokenWindows, WindowSampler
 from ..data.pretrain import build_pretrain_dataset, collate_rows
 from ..data.sft import build_sft_dataset, collate_sft
+from ..utils.device import resolve_precision
 from .checkpoint import (
     latest_checkpoint,
     load_checkpoint,
@@ -143,6 +145,31 @@ def restore_rng(local):
         torch.cuda.set_rng_state(torch.from_numpy(np.array(local["rng_cuda"], dtype=np.uint8)))
 
 
+def apply_overrides(spec: dict, overrides) -> dict:
+    """Apply ``section.key=value`` overrides; values are parsed as YAML.
+
+    ``training.target_tokens=100000000`` sets an int, ``training.epochs=null``
+    removes a setting, ``model.gradient_checkpointing=false`` sets a bool.
+    """
+    for item in overrides or ():
+        key, sep, raw = item.partition("=")
+        if not sep or not key.strip():
+            raise ValueError(f"override must look like section.key=value, got {item!r}")
+        value = yaml.safe_load(raw)
+        if isinstance(value, str):
+            try:  # YAML reads 1e8 as a string; accept scientific notation for numbers
+                number = float(value)
+                value = int(number) if number.is_integer() else number
+            except ValueError:
+                pass
+        node = spec
+        *parents, leaf = key.strip().split(".")
+        for name in parents:
+            node = node.setdefault(name, {})
+        node[leaf] = value
+    return spec
+
+
 def allreduce_int(value: int, device: torch.device, world: int) -> int:
     if world == 1:
         return int(value)
@@ -196,9 +223,16 @@ def main():
         "--init-from",
         help="model directory from save_pretrained(); starts a new optimizer/scheduler",
     )
+    ap.add_argument(
+        "--set",
+        action="append",
+        default=[],
+        metavar="SECTION.KEY=VALUE",
+        help="override a config value, e.g. --set training.target_tokens=100000000 (repeatable)",
+    )
     args = ap.parse_args()
 
-    spec = yaml.safe_load(Path(args.config).read_text())
+    spec = apply_overrides(yaml.safe_load(Path(args.config).read_text()), args.set)
     cfg = IARMXConfig.from_dict(spec["model"])
     train = spec["training"]
     data_cfg = spec["data"]
@@ -303,10 +337,11 @@ def main():
     tokens_seen = 0
     examples_seen = 0
     data_state = None
+    resumed_extra = {}
     if args.resume:
         ckpt = load_checkpoint(args.resume, base_model, optimizer, sched, map_location=device)
         step = int(ckpt.get("step", 0))
-        extra = ckpt.get("extra") or {}
+        extra = resumed_extra = ckpt.get("extra") or {}
         tokens_seen = int(extra.get("tokens_seen", 0))
         examples_seen = int(extra.get("examples_seen", 0))
         data_state = extra.get("data")
@@ -416,6 +451,7 @@ def main():
             "examples_seen": examples_seen,
             "warmup_tokens": schedule["warmup_tokens"],
             "global_batch": int(train["micro_batch_size"]) * grad_accum * world,
+            "scaler": scaler.state_dict() if scaler.is_enabled() else None,
             "data": capture_data_state(loader, sampler_epoch, position, world),
         }
 
@@ -426,11 +462,19 @@ def main():
         ddp_kwargs = {"device_ids": [device.index]} if device.type == "cuda" else {}
         model = torch.nn.parallel.DistributedDataParallel(model, **ddp_kwargs)
 
-    amp_dtype = (
-        torch.bfloat16
-        if train.get("precision", "bf16") == "bf16"
-        else torch.float16
-    )
+    requested_precision = str(train.get("precision", "bf16"))
+    precision = resolve_precision(requested_precision, device)
+    amp_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}.get(precision)
+    # fp16 needs loss scaling; GPUs without native bf16 (T4, V100, P100) use it.
+    scaler = torch.amp.GradScaler("cuda", enabled=precision == "fp16")
+    if scaler.is_enabled() and resumed_extra.get("scaler"):
+        scaler.load_state_dict(resumed_extra["scaler"])
+    if rank == 0 and device.type == "cuda" and requested_precision not in ("auto", precision):
+        print(
+            f"{requested_precision} is not natively supported on this GPU; training in {precision} "
+            "with loss scaling",
+            flush=True,
+        )
     grad_accum = int(train.get("grad_accum", 1))
     save_every = int(train.get("save_every", 1000))
     keep_last = int(train.get("keep_last", 0))
@@ -440,8 +484,8 @@ def main():
     if rank == 0:
         print(
             f"params={base_model.num_parameters():,} stage={stage} world={world} "
-            f"scheduler_steps={total} target_tokens={train.get('target_tokens')} "
-            f"epochs={train.get('epochs')}",
+            f"precision={precision} scheduler_steps={total} "
+            f"target_tokens={train.get('target_tokens')} epochs={train.get('epochs')}",
             flush=True,
         )
 
@@ -452,6 +496,7 @@ def main():
         # After iter(): creating an iterator draws a base seed from the global RNG,
         # which the uninterrupted run did before the checkpointed step, not after.
         restore_rng(rng_state)
+    log_time, log_tokens = time.perf_counter(), tokens_seen
     while not should_stop(step, tokens_seen, examples_seen, train, dataset_len):
         running = 0.0
         local_tokens = 0
@@ -480,16 +525,18 @@ def main():
             with sync_ctx:
                 with torch.autocast(
                     device_type=device.type,
-                    dtype=amp_dtype,
-                    enabled=device.type == "cuda",
+                    dtype=amp_dtype or torch.float32,
+                    enabled=amp_dtype is not None,
                 ):
                     out = model(**batch)
                     loss = out.loss / grad_accum
-                loss.backward()
+                scaler.scale(loss).backward()
             running = running + loss.detach()  # synchronizes only when logged
 
+        scaler.unscale_(optimizer)  # no-op unless fp16
         torch.nn.utils.clip_grad_norm_(model.parameters(), train.get("grad_clip", 1.0))
-        optimizer.step()
+        scaler.step(optimizer)  # skips the update if fp16 gradients overflowed
+        scaler.update()
         optimizer.zero_grad(set_to_none=True)
         step += 1
         tokens_seen += allreduce_int(local_tokens, device, world)
@@ -500,9 +547,12 @@ def main():
         sched.step()  # sets the learning rate for the next step
 
         if rank == 0 and step % int(train.get("log_every", 10)) == 0:
+            now = time.perf_counter()
+            rate = (tokens_seen - log_tokens) / max(now - log_time, 1e-9)
+            log_time, log_tokens = now, tokens_seen
             print(
                 f"step={step} loss={running:.4f} lr={sched.get_last_lr()[0]:.3e} "
-                f"tokens={tokens_seen:,} examples={examples_seen:,}",
+                f"tokens={tokens_seen:,} examples={examples_seen:,} tok/s={rate:,.0f}",
                 flush=True,
             )
         if step % save_every == 0:

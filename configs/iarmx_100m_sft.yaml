@@ -26,12 +26,12 @@ data:
   tokenizer: gpt2
   dataset: HuggingFaceH4/ultrachat_200k
   split: train_sft
-  seq_len: 512
+  seq_len: 2048           # conversations up to 2048 tokens (~1,500 words)
 
 training:
   init_from: checkpoints/iarmx-100m-pretrain/final
   seed: 42
-  micro_batch_size: 16
+  micro_batch_size: 4
   grad_accum: 8
   epochs: 2
   lr: 0.00025

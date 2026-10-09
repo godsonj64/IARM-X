@@ -9,6 +9,33 @@
 
 > **Research status.** IARM-X is a correctness-validated reference implementation intended for controlled architecture experiments. It is not yet a claim of state-of-the-art performance. The recurrent scan runs as an exact chunkwise-parallel algorithm (`scan_impl: chunk`, the default) and keeps the per-token loop (`scan_impl: loop`) as its correctness oracle; a fused Triton/CUDA kernel is still needed before making systems-performance claims. See [`docs/TRAINING_BUDGET.md`](docs/TRAINING_BUDGET.md) for the compute and cost analysis of the 10B-token recipe.
 
+## Quickstart: Colab, Kaggle or any Jupyter GPU
+
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/godsonj64/IARM-X/blob/claude/eloquent-dirac-9cqy7j/notebooks/iarmx_colab.ipynb)
+
+[`notebooks/iarmx_colab.ipynb`](notebooks/iarmx_colab.ipynb) runs the whole recipe from a fresh notebook:
+
+1. clone and install;
+2. check the GPU (bf16, or fp16 with loss scaling on T4/V100/P100);
+3. sanity tests and a GPU benchmark;
+4. pretraining on streamed FineWeb-Edu at a 2048-token context;
+5. the full 10B-token run's time and cost, projected from the speed measured on your GPU;
+6. UltraChat chat-tuning;
+7. a chat with the model.
+
+Checkpoints go to Google Drive on Colab, and rerunning after a disconnect resumes exactly. The default `PLAN = "pilot"` (50M tokens) takes about an hour on a free T4. `PLAN = "full"` is the 10B-token run for an A100/H100-class GPU.
+
+The same flow from a terminal:
+
+```bash
+git clone https://github.com/godsonj64/IARM-X.git && cd IARM-X
+pip install -e '.[dev]'
+python -m iarmx.training.train --config configs/iarmx_100m_pretrain.yaml --resume auto \
+  --set training.target_tokens=50000000 --set training.precision=auto
+```
+
+`--set section.key=value` overrides any config value without editing the YAML.
+
 ## Why IARM-X
 
 The original IARM design replaces pairwise self-attention with softmax-gated low-rank algebraic resonance operators and a coordinatewise normalized causal memory. IARM-X keeps that efficient slow-memory mechanism and adds two capabilities that are difficult for a purely compressed recurrent state:
@@ -50,7 +77,7 @@ resonance operators/head   4
 operator rank             16
 fast-memory rank          32
 schedule              R,R,R,A x 2
-training context          512
+training context        2048
 max configured context   2048
 parameters        100,202,256
 ```
@@ -196,7 +223,7 @@ python scripts/pretokenize.py --out data/tokens/fineweb-edu-10bt-gpt2 --num-proc
 MEMMAP=1 bash scripts/train_100m.sh
 ```
 
-`scripts/pretokenize.py` keeps every document whole (no truncation), appends one EOS per document and writes about 20 GB of `uint16` token shards plus an `index.json`. It runs on CPU, so do it before renting a GPU. `configs/iarmx_100m_pretrain_memmap.yaml` trains on fixed 512-token windows read from those shards; every token is a training target exactly once per epoch and no compute is spent on padding. Add `--data-files "data/raw/fineweb-edu-10bt/sample/10BT/*.parquet"` to tokenize the local copy from `scripts/download_datasets.py` instead of streaming from the Hub.
+`scripts/pretokenize.py` keeps every document whole (no truncation), appends one EOS per document and writes about 20 GB of `uint16` token shards plus an `index.json`. It runs on CPU, so do it before renting a GPU. `configs/iarmx_100m_pretrain_memmap.yaml` trains on fixed 2048-token windows read from those shards; every token is a training target exactly once per epoch and no compute is spent on padding. Add `--data-files "data/raw/fineweb-edu-10bt/sample/10BT/*.parquet"` to tokenize the local copy from `scripts/download_datasets.py` instead of streaming from the Hub.
 
 For a pilot, write a small shard set to its own directory (`--max-tokens 100000000 --out data/tokens/pilot`) and point a copy of the config at it with `path: data/tokens/pilot` and a matching `target_tokens` (for example `100000000`). If `target_tokens` exceeds the tokens in the shard set, training repeats the data and prints a warning at startup saying how many times.
 
@@ -302,7 +329,7 @@ torchrun --standalone --nproc_per_node=8 -m iarmx.training.train \
   --config configs/iarmx_100m_pretrain.yaml
 ```
 
-The trainer includes BF16 autocast, FP32 persistent recurrent state, packed fixed-length rows, gradient accumulation, AdamW parameter groups, cosine decay with warmup (with `target_tokens` the decay follows tokens seen, so it ends exactly at the token budget whatever the GPU count), gradient clipping, DDP data partitioning, DDP `no_sync()` during accumulation, gradient checkpointing, checkpointing, optional `torch.compile`, and resumable optimizer/scheduler/step state.
+The trainer includes BF16 autocast (`precision: auto` or `bf16` falls back to FP16 with loss scaling on GPUs without native BF16, such as the T4), FP32 persistent recurrent state, packed fixed-length rows, gradient accumulation, AdamW parameter groups, cosine decay with warmup (with `target_tokens` the decay follows tokens seen, so it ends exactly at the token budget whatever the GPU count), gradient clipping, DDP data partitioning, DDP `no_sync()` during accumulation, gradient checkpointing, checkpointing, optional `torch.compile`, and resumable optimizer/scheduler/step state.
 
 ### Resume a run
 
@@ -326,9 +353,12 @@ With the same GPU count and settings, a resumed run reproduces the uninterrupted
 ```bash
 iarmx-generate \
   --model checkpoints/iarmx-100m-sft/final \
+  --chat \
   --prompt "Explain associative memory in simple terms." \
   --max-new-tokens 128
 ```
+
+`--chat` wraps the prompt in the UltraChat turn format used for fine-tuning and stops at the end of the reply. Leave it out to continue plain text with a pretrained-only model.
 
 Cached generation maintains:
 
@@ -359,10 +389,11 @@ python scripts/smoke_test.py
 python -m compileall -q iarmx scripts tests
 ```
 
-The current documented regression suite passes **62/62 tests** and covers:
+The current documented regression suite passes **83/83 tests** and covers:
 
 - chunkwise-parallel vs per-token recurrent scan parity (outputs, state, gradients, cached decoding);
 - bit-exact resume on CPU for token-shard, streaming and map-style data (0 and 2 loader workers, epoch wraps before and after the resume point, 2-process DDP), token-shard resume on a different world size, `--resume auto`, atomic and pruned checkpoints, and a token-budget schedule that ends at `min_lr`;
+- notebook support: `--set` config overrides, fp16 fallback on GPUs without native bf16, the chat prompt format, and a static check of `notebooks/iarmx_colab.ipynb`;
 - pre-tokenization without truncation (bounded memory, ordered multiprocessing), token-window/label alignment across shards, fixed-length packed rows with one EOS per document, and special-token strings kept as text;
 - full-vs-cached and arbitrary-chunk parity;
 - zero future-token leakage;
@@ -396,6 +427,8 @@ IARM-X/
 │   ├── EXPERIMENTS.md
 │   ├── QA.md
 │   └── TRAINING_BUDGET.md
+├── notebooks/
+│   └── iarmx_colab.ipynb
 ├── iarmx/
 │   ├── config.py
 │   ├── generate.py

@@ -30,13 +30,13 @@ data:
   data_files:
     train: "data/raw/fineweb-edu-10bt/sample/10BT/*.parquet"
   split: train
-  seq_len: 512
+  seq_len: 2048           # training context; IARM-X pays only ~2% more compute than at 512
   streaming: true
   pack: true
 
 training:
   seed: 42
-  micro_batch_size: 8
+  micro_batch_size: 2      # x 2048 tokens x grad_accum 16 = 65,536 tokens per step
   grad_accum: 16
   target_tokens: 10000000000
   lr: 0.0006
