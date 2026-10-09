@@ -35,7 +35,8 @@ class ResonanceTransform(nn.Module):
         gates = self.gate(controller).view(b, t, h, self.n_operators).softmax(-1)
         # V^T x -> [B,T,H,O,R]
         low = torch.einsum("bthd,hodr->bthor", x, self.v)
-        # U (V^T x) -> [B,T,H,O,D]
-        resp = torch.einsum("bthor,hodr->bthod", low, self.u)
-        delta = (gates.unsqueeze(-1) * resp).sum(-2) / math.sqrt(self.rank)
+        # sum_o g_o U_o (V_o^T x) as one contraction over (o, r): never materializes
+        # the O-times-larger [B,T,H,O,D] per-operator responses.
+        delta = torch.einsum("bthor,hodr->bthd", low * gates.unsqueeze(-1), self.u)
+        delta = delta / math.sqrt(self.rank)
         return x + delta, gates, delta

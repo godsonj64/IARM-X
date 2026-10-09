@@ -267,9 +267,11 @@ def main():
                 iterator = iter(loader)
                 batch = next(iterator)
 
-            batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
-            local_tokens += int((batch["labels"] != -100).sum().item())
+            # Count on the CPU copy: a .item() on a device tensor would block the host
+            # from queueing the next kernels on every micro-step.
+            local_tokens += int((batch["labels"] != -100).sum())
             local_examples += int(batch["input_ids"].size(0))
+            batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
             sync_ctx = (
                 model.no_sync()
                 if world > 1 and micro < grad_accum - 1 and hasattr(model, "no_sync")
@@ -284,7 +286,7 @@ def main():
                     out = model(**batch)
                     loss = out.loss / grad_accum
                 loss.backward()
-            running += float(loss.detach())
+            running = running + loss.detach()  # synchronizes only when logged
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), train.get("grad_clip", 1.0))
         optimizer.step()

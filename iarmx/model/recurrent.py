@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from ..config import IARMXConfig
 from .layers import RMSNorm, SwiGLU, RotaryEmbedding, CausalDepthwiseConv1d
 from .resonance import ResonanceTransform
+from .scan import fast_memory_chunked, slow_memory_parallel
 from .state import RecurrentLayerState
 
 
@@ -47,7 +48,9 @@ class IARMXRecurrentBlock(nn.Module):
         self.ffn = SwiGLU(d, cfg.ffn_hidden, cfg.dropout)
 
     def _decay(self, h: torch.Tensor) -> torch.Tensor:
-        raw = torch.sigmoid(self.decay(h))
+        # FP32 before the squash: BF16 spacing near 1.0 is 2^-8, which would round
+        # every decay above ~0.998 to exactly 1.0 and make 0.9999 unreachable.
+        raw = torch.sigmoid(self.decay(h).float())
         lo, hi = self.cfg.memory_decay_min, self.cfg.memory_decay_max
         return lo + (hi - lo) * raw
 
@@ -62,29 +65,12 @@ class IARMXRecurrentBlock(nn.Module):
             conv_cache=torch.zeros(batch, max(k - 1, 0), self.cfg.dim, device=device, dtype=dtype),
         )
 
-    def forward(self, x: torch.Tensor, positions: torch.Tensor, state: RecurrentLayerState | None = None):
-        b, t, d = x.shape
-        hnorm = self.norm1(x)
-        q = self.q_proj(hnorm).view(b, t, self.cfg.n_heads, self.cfg.head_dim)
-        k = self.k_proj(hnorm).view_as(q)
-        v = self.v_proj(hnorm).view_as(q)
-        cos, sin = self.rope.cos_sin(positions, q.dtype)
-        q = self.rope.apply_rotary(q, cos, sin)
-        k = self.rope.apply_rotary(k, cos, sin)
-        q, qg, qdelta = self.q_res(q, hnorm)
-        k, kg, _ = self.k_res(k, hnorm)
-
-        phi = F.elu(q) + 1.0
-        if state is None:
-            state = self.initial_state(b, x.device, hnorm.dtype)
-        local_raw, new_conv_cache = self.local.forward_with_cache(hnorm, state.conv_cache)
-        local = local_raw.view_as(v)
-
+    def _scan_loop(self, phi, q, k, v, hnorm, state: RecurrentLayerState):
+        """Per-token reference recurrence: the correctness oracle for ``_scan_parallel``."""
+        t = phi.size(1)
         num, den, fast = state.slow_num.float(), state.slow_den.float(), state.fast.float()
         slow_seq, fast_seq, imp_seq = [], [], []
 
-        # Exact recurrent semantics. A fused chunkwise CUDA/Triton scan remains a
-        # performance optimization; this reference path is the correctness oracle.
         for i in range(t):
             ph = phi[:, i].float()
             vv = v[:, i].float()
@@ -113,6 +99,44 @@ class IARMXRecurrentBlock(nn.Module):
         slow_all = torch.stack(slow_seq, dim=1)
         fast_all = torch.stack(fast_seq, dim=1)
         importance = torch.stack(imp_seq, dim=1)
+        return slow_all, fast_all, importance, num, den, fast
+
+    def _scan_parallel(self, phi, q, k, v, hnorm, state: RecurrentLayerState):
+        """Prefix-sum slow memory and chunkwise (UT-transform) fast memory; see scan.py."""
+        slow_all, num, den = slow_memory_parallel(
+            phi, v, state.slow_num, state.slow_den, self.cfg.slow_memory_eps
+        )
+        kk = F.normalize(self.mem_key(k).float(), dim=-1)
+        qq = F.normalize(self.mem_query(q).float(), dim=-1)
+        decay = self._decay(hnorm).float()
+        erase = torch.sigmoid(self.erase(hnorm)).float()
+        write = torch.sigmoid(self.write(hnorm)).float()
+        fast_all, fast = fast_memory_chunked(
+            kk, qq, v, decay, erase, write, state.fast, self.cfg.scan_chunk_size
+        )
+        importance = torch.sigmoid(self.importance(hnorm))
+        return slow_all.to(v.dtype), fast_all.to(v.dtype), importance, num, den, fast
+
+    def forward(self, x: torch.Tensor, positions: torch.Tensor, state: RecurrentLayerState | None = None):
+        b, t, d = x.shape
+        hnorm = self.norm1(x)
+        q = self.q_proj(hnorm).view(b, t, self.cfg.n_heads, self.cfg.head_dim)
+        k = self.k_proj(hnorm).view_as(q)
+        v = self.v_proj(hnorm).view_as(q)
+        cos, sin = self.rope.cos_sin(positions, q.dtype)
+        q = self.rope.apply_rotary(q, cos, sin)
+        k = self.rope.apply_rotary(k, cos, sin)
+        q, qg, qdelta = self.q_res(q, hnorm)
+        k, kg, _ = self.k_res(k, hnorm)
+
+        phi = F.elu(q) + 1.0
+        if state is None:
+            state = self.initial_state(b, x.device, hnorm.dtype)
+        local_raw, new_conv_cache = self.local.forward_with_cache(hnorm, state.conv_cache)
+        local = local_raw.view_as(v)
+
+        scan = self._scan_loop if self.cfg.scan_impl == "loop" else self._scan_parallel
+        slow_all, fast_all, importance, num, den, fast = scan(phi, q, k, v, hnorm, state)
         mix = self.fusion(hnorm).view(b, t, self.cfg.n_heads, 3).softmax(-1)
         y = mix[..., 0:1] * slow_all + mix[..., 1:2] * fast_all + mix[..., 2:3] * local
         y = y.reshape(b, t, d)
