@@ -34,6 +34,8 @@ class IARMXConfig:
     # implementation
     gradient_checkpointing: bool = False
     use_sdpa: bool = True
+    scan_impl: str = "chunk"  # "chunk" (parallel) or "loop" (per-token reference oracle)
+    scan_chunk_size: int = 64
 
     def __post_init__(self):
         if self.dim <= 0 or self.n_layers <= 0 or self.n_heads <= 0:
@@ -52,6 +54,10 @@ class IARMXConfig:
             raise ValueError("memory decay bounds must satisfy 0 <= min <= max <= 1")
         if self.max_seq_len <= 0:
             raise ValueError("max_seq_len must be positive")
+        if self.scan_impl not in ("chunk", "loop"):
+            raise ValueError("scan_impl must be 'chunk' or 'loop'")
+        if self.scan_chunk_size <= 0:
+            raise ValueError("scan_chunk_size must be positive")
 
     @property
     def head_dim(self) -> int:

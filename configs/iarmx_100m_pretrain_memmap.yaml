@@ -25,14 +25,12 @@ model:
 data:
   stage: pretrain
   tokenizer: gpt2
-  dataset: parquet
-  dataset_config: null
-  data_files:
-    train: "data/raw/fineweb-edu-10bt/sample/10BT/*.parquet"
-  split: train
+  # Token shards from: python scripts/pretokenize.py --out data/tokens/fineweb-edu-10bt-gpt2
+  # No truncation; --resume continues from the exact window, even with a new GPU count.
+  dataset: memmap
+  path: data/tokens/fineweb-edu-10bt-gpt2
   seq_len: 2048           # training context; IARM-X pays only ~2% more compute than at 512
-  streaming: true
-  pack: true
+  shuffle: true
 
 training:
   seed: 42

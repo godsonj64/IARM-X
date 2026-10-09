@@ -60,6 +60,10 @@ Every `attention_every` layers, a resonance-conditioned causal attention block p
 
 For fixed model width, recurrent blocks are linear in sequence length and maintain context-independent recurrent state. Exact attention blocks remain quadratic during full-sequence training and carry a growing KV cache during decoding. Because only a fraction of layers use attention, cache and attention compute are reduced relative to a full Transformer with the same depth.
 
+## Parallel training scan
+
+Slow memory is a prefix sum. Fast memory is a gated delta rule with a write strength decoupled from its erase strength, so each chunk of `scan_chunk_size` tokens reduces to a unit lower-triangular solve (the UT/WY transform) plus batched matrix products; only one small state update per chunk is sequential. `iarmx/model/scan.py` derives and implements this; `scan_impl: loop` keeps the per-token recurrence as the correctness oracle, and `tests/test_scan.py` checks outputs, states and gradients against it. Derivation, stability argument and measurements: [`TRAINING_BUDGET.md`](TRAINING_BUDGET.md#3-computational-mathematics-an-exact-parallel-recurrence-implemented).
+
 ## Research warning
 
-The current Python recurrent scan is semantically exact but is not yet a fused production kernel. Benchmarking the architecture fairly at large scale requires a Triton/CUDA chunkwise scan kernel, parameter/FLOP matching, and controlled training against Transformer and original-IARM baselines.
+The chunkwise scan is exact but is still composed from PyTorch operators rather than a fused production kernel. Benchmarking the architecture fairly at large scale requires a fused Triton/CUDA kernel, parameter/FLOP matching, and controlled training against Transformer and original-IARM baselines.

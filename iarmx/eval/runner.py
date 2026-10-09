@@ -4,6 +4,7 @@ import torch
 from ..model.model import IARMXForCausalLM
 from ..data.tokenizer import load_tokenizer
 from .recall import exact_match_recall
+from ..utils.device import inference_dtype
 
 
 def main():
@@ -13,8 +14,7 @@ def main():
     ap.add_argument("--pairs", type=int, default=16)
     args = ap.parse_args()
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype = torch.bfloat16 if device == "cuda" else torch.float32
-    model = IARMXForCausalLM.from_pretrained(args.model, device=device, dtype=dtype)
+    model = IARMXForCausalLM.from_pretrained(args.model, device=device, dtype=inference_dtype(device))
     tok = load_tokenizer(args.tokenizer)
     result = exact_match_recall(model, tok, pairs=args.pairs)
     print(json.dumps(result, indent=2))

@@ -9,7 +9,8 @@ def render_ultrachat(messages, tokenizer):
     for m in messages:
         role = m.get("role", "user")
         content = m.get("content", "")
-        toks = tokenizer.encode(content, add_special_tokens=False)
+        # Literal control-token strings in message text stay ordinary text.
+        toks = tokenizer.encode(content, add_special_tokens=False, split_special_tokens=True)
         is_assistant = role == "assistant"
         prefix = asst_id if is_assistant else user_id
         seg = [prefix] + toks + [end_id]

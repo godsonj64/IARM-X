@@ -29,3 +29,16 @@ def test_budget_stop_conditions():
     assert should_stop(10, 100, 0, {"target_tokens": 100})
     assert not should_stop(3, 0, 19, {"epochs": 2}, dataset_len=10)
     assert should_stop(3, 0, 20, {"epochs": 2}, dataset_len=10)
+
+
+def test_100m_configs_default_to_2048_context_with_unchanged_tokens_per_step():
+    root = Path(__file__).resolve().parents[1]
+    for name in ["iarmx_100m_pretrain", "iarmx_100m_pretrain_local", "iarmx_100m_pretrain_memmap"]:
+        spec = yaml.safe_load((root / "configs" / f"{name}.yaml").read_text())
+        train, data = spec["training"], spec["data"]
+        assert data["seq_len"] == 2048 <= spec["model"]["max_seq_len"], name
+        assert train["micro_batch_size"] * train["grad_accum"] * data["seq_len"] == 65_536, name
+        assert estimate_total_steps(train, data, world=1) == 152_588, name
+    for name in ["iarmx_100m_sft", "iarmx_100m_sft_local"]:
+        spec = yaml.safe_load((root / "configs" / f"{name}.yaml").read_text())
+        assert spec["data"]["seq_len"] == 2048 <= spec["model"]["max_seq_len"], name

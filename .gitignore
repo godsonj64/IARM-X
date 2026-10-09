@@ -6,6 +6,7 @@ build/
 dist/
 *.egg-info/
 checkpoints/
+/data/
 runs/
 wandb/
 *.safetensors

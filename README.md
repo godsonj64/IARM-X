@@ -7,7 +7,37 @@
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue.svg)](pyproject.toml)
 [![PyTorch 2.5+](https://img.shields.io/badge/PyTorch-2.5%2B-ee4c2c.svg)](pyproject.toml)
 
-> **Research status.** IARM-X is a correctness-validated reference implementation intended for controlled architecture experiments. It is not yet a claim of state-of-the-art performance. The recurrent scan is deliberately written as a clear PyTorch reference implementation; serious large-scale throughput work should replace it with a fused chunkwise Triton/CUDA kernel before making systems-performance claims.
+> **Research status.** IARM-X is a correctness-validated reference implementation intended for controlled architecture experiments. It is not yet a claim of state-of-the-art performance. The recurrent scan runs as an exact chunkwise-parallel algorithm (`scan_impl: chunk`, the default) and keeps the per-token loop (`scan_impl: loop`) as its correctness oracle; a fused Triton/CUDA kernel is still needed before making systems-performance claims. See [`docs/TRAINING_BUDGET.md`](docs/TRAINING_BUDGET.md) for the compute and cost analysis of the 10B-token recipe.
+
+## Quickstart: Colab, Kaggle or any Jupyter GPU
+
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/godsonj64/IARM-X/blob/main/notebooks/iarmx_colab.ipynb)
+
+[`notebooks/iarmx_colab.ipynb`](notebooks/iarmx_colab.ipynb) runs the whole recipe from a fresh notebook:
+
+1. clone and install;
+2. check the GPU (bf16, or fp16 with loss scaling on T4/V100/P100);
+3. sanity tests and a GPU benchmark;
+4. pretraining on streamed FineWeb-Edu at a 2048-token context;
+5. the full 10B-token run's time and cost, projected from the speed measured on your GPU;
+6. UltraChat chat-tuning;
+7. a chat with the model.
+
+Checkpoints go to Google Drive on Colab (only the newest is kept), and rerunning after a disconnect resumes exactly. The default `PLAN = "pilot"` (20M tokens plus 50 chat-tuning steps) takes about 1–2 hours on a free T4 and 15–30 minutes on an A100/H100, including downloads and data preparation. `PLAN = "full"` is the 10B-token run for an A100/H100-class GPU. A failed step stops the notebook with its error rather than running on.
+
+The same flow from a terminal:
+
+```bash
+git clone https://github.com/godsonj64/IARM-X.git && cd IARM-X
+pip install -e '.[dev]'
+# a 20M-token pilot: short warmup, frequent checkpoints, prints tokens/s
+python -m iarmx.training.train --config configs/iarmx_100m_pretrain.yaml --resume auto \
+  --set training.target_tokens=20000000 --set training.warmup_steps=30 \
+  --set training.save_every=100 --set training.precision=auto \
+  --set training.output_dir=checkpoints/pilot
+```
+
+`--set section.key=value` overrides any config value without editing the YAML.
 
 ## Why IARM-X
 
@@ -50,7 +80,7 @@ resonance operators/head   4
 operator rank             16
 fast-memory rank          32
 schedule              R,R,R,A x 2
-training context          512
+training context        2048
 max configured context   2048
 parameters        100,202,256
 ```
@@ -189,11 +219,24 @@ The provided research recipe uses:
 - **Pretraining:** `HuggingFaceFW/fineweb-edu`, configuration `sample-10BT`.
 - **SFT:** `HuggingFaceH4/ultrachat_200k`, split `train_sft`.
 
+### Pre-tokenize once (recommended for paid or preemptible GPUs)
+
+```bash
+python scripts/pretokenize.py --out data/tokens/fineweb-edu-10bt-gpt2 --num-proc 8
+MEMMAP=1 bash scripts/train_100m.sh
+```
+
+`scripts/pretokenize.py` keeps every document whole (no truncation), appends one EOS per document and writes about 20 GB of `uint16` token shards plus an `index.json`. It runs on CPU, so do it before renting a GPU. `configs/iarmx_100m_pretrain_memmap.yaml` trains on fixed 2048-token windows read from those shards; every token is a training target exactly once per epoch and no compute is spent on padding. Add `--data-files "data/raw/fineweb-edu-10bt/sample/10BT/*.parquet"` to tokenize the local copy from `scripts/download_datasets.py` instead of streaming from the Hub.
+
+For a pilot, write a small shard set to its own directory (`--max-tokens 100000000 --out data/tokens/pilot`) and point a copy of the config at it with `path: data/tokens/pilot` and a matching `target_tokens` (for example `100000000`). If `target_tokens` exceeds the tokens in the shard set, training repeats the data and prints a warning at startup saying how many times.
+
 ### Stream FineWeb-Edu directly
 
 ```bash
 python -m iarmx.training.train --config configs/iarmx_100m_pretrain.yaml
 ```
+
+Streaming tokenizes on the fly and packs documents into fixed `seq_len` rows, one EOS after each document; nothing is truncated, and `micro_batch_size` counts rows, so every micro-batch has the same shape. Literal special-token strings in the text (`<|endoftext|>`, `<|user|>`, ...) stay ordinary text in both pipelines.
 
 ### Download datasets once
 
@@ -237,6 +280,7 @@ configs/
 ├── sft_debug.yaml
 ├── iarmx_100m_pretrain.yaml
 ├── iarmx_100m_pretrain_local.yaml
+├── iarmx_100m_pretrain_memmap.yaml
 ├── iarmx_100m_sft.yaml
 ├── iarmx_100m_sft_local.yaml
 └── iarmx_1.3b.yaml
@@ -288,7 +332,7 @@ torchrun --standalone --nproc_per_node=8 -m iarmx.training.train \
   --config configs/iarmx_100m_pretrain.yaml
 ```
 
-The trainer includes BF16 autocast, FP32 persistent recurrent state, packed document collation, gradient accumulation, AdamW parameter groups, cosine decay with warmup, gradient clipping, DDP data partitioning, DDP `no_sync()` during accumulation, gradient checkpointing, checkpointing, optional `torch.compile`, and resumable optimizer/scheduler/step state.
+The trainer includes BF16 autocast (`precision: auto` or `bf16` falls back to FP16 with loss scaling on GPUs without native BF16, such as the T4), FP32 persistent recurrent state, packed fixed-length rows, gradient accumulation, AdamW parameter groups, cosine decay with warmup (with `target_tokens` the decay follows tokens seen, so it ends exactly at the token budget whatever the GPU count), gradient clipping, DDP data partitioning, DDP `no_sync()` during accumulation, gradient checkpointing, checkpointing, optional `torch.compile`, and resumable optimizer/scheduler/step state.
 
 ### Resume a run
 
@@ -298,16 +342,26 @@ iarmx-train \
   --resume checkpoints/iarmx-100m-pretrain/step-10000.pt
 ```
 
-`--resume` restores model, optimizer, scheduler, step, and tracked training counters. `--init-from` loads pretrained model weights into a fresh training stage.
+`--resume auto` picks the newest checkpoint in the config's `output_dir` (or starts fresh if there is none); `scripts/train_100m.sh` uses it, so rerunning the script after a preemption continues where it stopped. Checkpoints are written atomically, and `keep_last: 3` in the 100M pretraining configs deletes older `step-N.pt` files (about 1.2 GB each).
+
+`--resume` restores model, optimizer, scheduler, step, tracked training counters, each rank's RNG streams and the exact data position, so a resumed run continues with the next unseen batch instead of replaying data:
+
+- `dataset: memmap` stores the global window position, so the data continues exactly even on a different number of GPUs. Keep `micro_batch_size x grad_accum x GPUs` constant in that case (the trainer warns if it changes); the learning rate follows tokens seen, so it does not jump.
+- Streaming and map-style datasets (including SFT) store each rank's `StatefulDataLoader` state; they resume exactly with the same number of GPUs and `num_workers`, and refuse to resume otherwise rather than replay data.
+
+With the same GPU count and settings, a resumed run reproduces the uninterrupted run bit-for-bit on CPU (`tests/test_resume.py`). On GPUs it sees the same data in the same order with the same RNG streams, but CUDA kernels are not bitwise deterministic, so weights match only approximately (as between any two GPU runs); after a GPU-count change the RNG streams are reseeded. `--init-from` loads pretrained model weights into a fresh training stage, starting its data from the beginning; with `--resume`, a config-level `init_from` is ignored because the checkpoint already holds the weights.
 
 ## Generation
 
 ```bash
 iarmx-generate \
   --model checkpoints/iarmx-100m-sft/final \
+  --chat \
   --prompt "Explain associative memory in simple terms." \
   --max-new-tokens 128
 ```
+
+`--chat` wraps the prompt in the UltraChat turn format used for fine-tuning and stops at the end of the reply. Leave it out to continue plain text with a pretrained-only model.
 
 Cached generation maintains:
 
@@ -338,8 +392,12 @@ python scripts/smoke_test.py
 python -m compileall -q iarmx scripts tests
 ```
 
-The current documented regression suite passes **21/21 tests** and covers:
+The current documented regression suite passes **83/83 tests** and covers:
 
+- chunkwise-parallel vs per-token recurrent scan parity (outputs, state, gradients, cached decoding);
+- bit-exact resume on CPU for token-shard, streaming and map-style data (0 and 2 loader workers, epoch wraps before and after the resume point, 2-process DDP), token-shard resume on a different world size, `--resume auto`, atomic and pruned checkpoints, and a token-budget schedule that ends at `min_lr`;
+- notebook support: `--set` config overrides, fp16 fallback on GPUs without native bf16, the chat prompt format, and a static check of `notebooks/iarmx_colab.ipynb`;
+- pre-tokenization without truncation (bounded memory, ordered multiprocessing), token-window/label alignment across shards, fixed-length packed rows with one EOS per document, and special-token strings kept as text;
 - full-vs-cached and arbitrary-chunk parity;
 - zero future-token leakage;
 - exact convolution-cache behavior;
@@ -370,7 +428,10 @@ IARM-X/
 ├── docs/
 │   ├── ARCHITECTURE.md
 │   ├── EXPERIMENTS.md
-│   └── QA.md
+│   ├── QA.md
+│   └── TRAINING_BUDGET.md
+├── notebooks/
+│   └── iarmx_colab.ipynb
 ├── iarmx/
 │   ├── config.py
 │   ├── generate.py
@@ -380,8 +441,11 @@ IARM-X/
 │   ├── training/
 │   └── utils/
 ├── scripts/
+│   ├── bench_scan.py
 │   ├── count_params.py
 │   ├── download_datasets.py
+│   ├── estimate_cost.py
+│   ├── pretokenize.py
 │   ├── profile_model.py
 │   ├── smoke_test.py
 │   └── train_100m.sh

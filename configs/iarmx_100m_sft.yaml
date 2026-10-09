@@ -26,13 +26,13 @@ data:
   tokenizer: gpt2
   dataset: HuggingFaceH4/ultrachat_200k
   split: train_sft
-  seq_len: 512
+  seq_len: 2048           # conversations up to 2048 tokens (~1,500 words)
 
 training:
   init_from: checkpoints/iarmx-100m-pretrain/final
   seed: 42
-  micro_batch_size: 16
-  grad_accum: 8
+  micro_batch_size: 4
+  grad_accum: 32           # 4 x 32 = 128 conversations per step, as at 512 context
   epochs: 2
   lr: 0.00025
   min_lr: 0.000025
@@ -45,4 +45,5 @@ training:
   num_workers: 2
   log_every: 10
   save_every: 500
+  keep_last: 3             # older step-N.pt files are deleted (~1.2 GB each)
   output_dir: checkpoints/iarmx-100m-sft

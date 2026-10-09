@@ -97,6 +97,13 @@ class ResonanceAttentionBlock(nn.Module):
                 k_extra = (key_bias * math.sqrt(d)).unsqueeze(-1).to(kh.dtype)
                 q_attn = torch.cat([qh, q_extra], dim=-1)
                 k_attn = torch.cat([kh, k_extra], dim=-1)
+                # Zero-pad Q/K to a multiple of 8 (65 -> 72): the dot products are
+                # unchanged, and the memory-efficient SDPA kernel, which needs
+                # 8-aligned head dims, can run instead of the O(T^2)-memory math path.
+                pad = (-q_attn.size(-1)) % 8
+                if pad:
+                    q_attn = F.pad(q_attn, (0, pad))
+                    k_attn = F.pad(k_attn, (0, pad))
 
             scale = 1.0 / math.sqrt(d)
             if past == 0:
