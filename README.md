@@ -11,7 +11,7 @@
 
 ## Quickstart: Colab, Kaggle or any Jupyter GPU
 
-[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/godsonj64/IARM-X/blob/claude/eloquent-dirac-9cqy7j/notebooks/iarmx_colab.ipynb)
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/godsonj64/IARM-X/blob/main/notebooks/iarmx_colab.ipynb)
 
 [`notebooks/iarmx_colab.ipynb`](notebooks/iarmx_colab.ipynb) runs the whole recipe from a fresh notebook:
 
@@ -25,12 +25,10 @@
 
 Checkpoints go to Google Drive on Colab (only the newest is kept), and rerunning after a disconnect resumes exactly. The default `PLAN = "pilot"` (20M tokens plus 50 chat-tuning steps) takes about 1–2 hours on a free T4 and 15–30 minutes on an A100/H100, including downloads and data preparation. `PLAN = "full"` is the 10B-token run for an A100/H100-class GPU. A failed step stops the notebook with its error rather than running on.
 
-Until this work is merged, the notebook clones the `claude/eloquent-dirac-9cqy7j` branch; set `BRANCH = "main"` after merging.
-
 The same flow from a terminal:
 
 ```bash
-git clone -b claude/eloquent-dirac-9cqy7j https://github.com/godsonj64/IARM-X.git && cd IARM-X
+git clone https://github.com/godsonj64/IARM-X.git && cd IARM-X
 pip install -e '.[dev]'
 # a 20M-token pilot: short warmup, frequent checkpoints, prints tokens/s
 python -m iarmx.training.train --config configs/iarmx_100m_pretrain.yaml --resume auto \
