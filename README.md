@@ -7,7 +7,7 @@
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue.svg)](pyproject.toml)
 [![PyTorch 2.5+](https://img.shields.io/badge/PyTorch-2.5%2B-ee4c2c.svg)](pyproject.toml)
 
-> **Research status.** IARM-X is a correctness-validated reference implementation intended for controlled architecture experiments. It is not yet a claim of state-of-the-art performance. The recurrent scan is deliberately written as a clear PyTorch reference implementation; serious large-scale throughput work should replace it with a fused chunkwise Triton/CUDA kernel before making systems-performance claims.
+> **Research status.** IARM-X is a correctness-validated reference implementation intended for controlled architecture experiments. It is not yet a claim of state-of-the-art performance. The recurrent scan runs as an exact chunkwise-parallel algorithm (`scan_impl: chunk`, the default) and keeps the per-token loop (`scan_impl: loop`) as its correctness oracle; a fused Triton/CUDA kernel is still needed before making systems-performance claims. See [`docs/TRAINING_BUDGET.md`](docs/TRAINING_BUDGET.md) for the compute and cost analysis of the 10B-token recipe.
 
 ## Why IARM-X
 
@@ -338,8 +338,9 @@ python scripts/smoke_test.py
 python -m compileall -q iarmx scripts tests
 ```
 
-The current documented regression suite passes **21/21 tests** and covers:
+The current documented regression suite passes **35/35 tests** and covers:
 
+- chunkwise-parallel vs per-token recurrent scan parity (outputs, state, gradients, cached decoding);
 - full-vs-cached and arbitrary-chunk parity;
 - zero future-token leakage;
 - exact convolution-cache behavior;
@@ -370,7 +371,8 @@ IARM-X/
 ├── docs/
 │   ├── ARCHITECTURE.md
 │   ├── EXPERIMENTS.md
-│   └── QA.md
+│   ├── QA.md
+│   └── TRAINING_BUDGET.md
 ├── iarmx/
 │   ├── config.py
 │   ├── generate.py
@@ -380,8 +382,10 @@ IARM-X/
 │   ├── training/
 │   └── utils/
 ├── scripts/
+│   ├── bench_scan.py
 │   ├── count_params.py
 │   ├── download_datasets.py
+│   ├── estimate_cost.py
 │   ├── profile_model.py
 │   ├── smoke_test.py
 │   └── train_100m.sh
